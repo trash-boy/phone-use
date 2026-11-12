@@ -23,3 +23,6 @@ browser-control/.env.*
 
 browser-control/pkg/
 browser-control/pkg-node/
+
+# Exclude standalone dependency test build output.
+**/target/

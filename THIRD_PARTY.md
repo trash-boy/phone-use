@@ -5,7 +5,7 @@
 | 组件 | 版本 / 提交 | 许可证 | 引入方式 | 改动 |
 |---|---|---|---|---|
 | [idevice](https://github.com/jkcoxson/idevice) | 上游 master `89702099`（0.1.68 之后、未发版） | MIT | git 依赖，`[patch.crates-io]` | 无（0.1.68 的 cryptexd install 会挂住；发版后换回 crates.io） |
-| [jktcp](https://crates.io/crates/jktcp) | 0.1.8（间接） | MIT | crates.io | 无 |
+| [jktcp](https://crates.io/crates/jktcp) | 0.1.8（间接，精确锁定） | MIT | `vendor/jktcp`，`[patch.crates-io]` | 发送队列、序号与报文入队在可取消 I/O 前原子提交，防止背压取消后按新序号重复发送；保留未完成的底层 flush。重传改为连接级计时、1 秒初始 RTO 和指数退避，有效 ACK 推进才重新计时，支持部分 ACK 并拒绝超前 ACK。新增背压/flush 取消及 WAN 时序测试，保留上游源码、许可证与测试依赖锁；见 `provenance.json` |
 | [rmcp](https://github.com/modelcontextprotocol/rust-sdk) | 3.8.0 | Apache-2.0（部分历史代码 MIT） | crates.io | 无 |
 | [apple-codesign](https://github.com/indygreg/apple-platform-rs) | 0.29.0（取自 Impactor `3rdparty/apple-codesign-0.29.0`） | MPL-2.0 | `vendor/apple-codesign`，`[patch.crates-io]` | Impactor 的 0o755 权限补丁（上游提交 428b42f）；本仓库删掉了上游的 `tests/`、`docs/`、`src/testdata/`（单元测试的证书和密钥样例）、`Cargo.lock`、`Cargo.toml.orig`，Cargo.toml 去掉 `[[test]]` 目标、`zip` 依赖从 2.x 升到 9.4.1（修安全告警；只有公证功能用它写 zip，API 兼容），源码未改（因此 vendor 里的单元测试不能运行，本仓库也不跑它们） |
 | [Impactor](https://github.com/claration/impactor) `plume_core` | v2.7.2（提交 b13d99559febd63e3710dfdd0ef8cdd78d10ae13） | MPL-2.0 | `vendor/plume_core` | `src/lib.rs` 关闭 HTTP 空闲连接复用，避免 Apple 登录期间复用连接被重置，文件内标注本地修改并保留 MPL-2.0。Cargo.toml 把 workspace 继承展开成显式版本、修正 omnisette 路径，reqwest 用 `rustls-no-provider`（不编 aws-lc-rs），omnisette 改为 `default-features = false, features = ["remote-anisette", "remote-anisette-v3"]` |

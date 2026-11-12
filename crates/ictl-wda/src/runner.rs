@@ -72,6 +72,7 @@ fn launch_hint(msg: String) -> String {
 #[derive(Default)]
 struct Progress {
     errors: Vec<String>,
+    exit_reason: Option<String>,
     automation_wait: Option<tokio::time::Instant>,
     /// 新 runner 已开始执行测试计划（WDA 的 HTTP 服务在测试里启动，一定晚于它）
     plan_started: bool,
@@ -141,6 +142,7 @@ impl XCUITestListener for ErrorListener {
 
 pub struct WdaRunner {
     task: JoinHandle<std::result::Result<(), IdeviceError>>,
+    progress: Arc<Mutex<Progress>>,
 }
 
 impl WdaRunner {
@@ -169,11 +171,16 @@ impl WdaRunner {
         let progress = Arc::new(Mutex::new(Progress::default()));
         let task = {
             let (provider, progress) = (provider.clone(), progress.clone());
-            tokio::spawn(
-                async move { XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress), None).await },
-            )
+            tokio::spawn(async move {
+                let result = XCUITestService::new(provider).run(cfg, &mut ErrorListener(progress.clone()), None).await;
+                progress.lock().unwrap().exit_reason = Some(match &result {
+                    Ok(()) => "XCTest test plan ended".to_owned(),
+                    Err(error) => format!("XCTest: {error}"),
+                });
+                result
+            })
         };
-        let mut runner = Self { task };
+        let mut runner = Self { task, progress: progress.clone() };
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
 
         let failure = |extra: Option<String>| {
@@ -235,6 +242,14 @@ impl WdaRunner {
     /// runner 任务是否还活着。死了就算手机上的 WDA 还在响应也不能用
     pub fn alive(&self) -> bool {
         !self.task.is_finished()
+    }
+
+    pub fn exit_reason(&self) -> Option<String> {
+        if self.alive() {
+            return None;
+        }
+        let progress = self.progress.lock().unwrap();
+        Some(progress.exit_reason.clone().unwrap_or_else(|| "XCTest task panicked or was cancelled".to_owned()))
     }
 
     /// 停掉 runner（即丢掉它，见 Drop）

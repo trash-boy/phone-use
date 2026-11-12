@@ -650,6 +650,7 @@ impl Session {
                     },
                     _ = heartbeat.tick() => {
                         if !writer_alive.swap(false, Ordering::SeqCst) {
+                            eprintln!("{} USB relay closed: heartbeat pong missing", chrono::Utc::now().to_rfc3339());
                             cancel.cancel();
                             break;
                         }
@@ -661,6 +662,8 @@ impl Session {
                     result = tokio::time::timeout(Duration::from_secs(20), sink.send(message)) => result,
                 };
                 if !matches!(sent, Ok(Ok(()))) {
+                    let cause = if sent.is_err() { "send timeout" } else { "socket send failed" };
+                    eprintln!("{} USB relay closed: {cause}", chrono::Utc::now().to_rfc3339());
                     cancel.cancel();
                     break;
                 }
@@ -725,9 +728,34 @@ impl Session {
                     Ok(())
                 }
                 Some(Ok(Message::Ping(_))) => Ok(()),
+                Some(Ok(Message::Close(_))) => {
+                    eprintln!("{} USB relay closed: browser closed socket", chrono::Utc::now().to_rfc3339());
+                    break;
+                }
+                Some(Err(_)) => {
+                    eprintln!("{} USB relay closed: socket receive failed", chrono::Utc::now().to_rfc3339());
+                    break;
+                }
                 _ => break,
             };
-            if result.is_err() {
+            if let Err(error) = result {
+                // Errors here describe framing/limits, never print binary frames,
+                // URLs, headers, pairing records or the peer's close reason.
+                let error = error.to_string();
+                let detail = match error.as_str() {
+                    "Invalid relay header"
+                    | "Invalid relay length"
+                    | "Unknown relay stream"
+                    | "Invalid OpenResult"
+                    | "Unexpected OpenResult"
+                    | "Unknown or unopened stream"
+                    | "Stream receive buffer exceeded"
+                    | "Invalid StreamData"
+                    | "Invalid StreamClose"
+                    | "Unsupported stream frame" => error.as_str(),
+                    _ => "invalid relay frame or device hello",
+                };
+                eprintln!("{} USB relay closed: rejected frame ({detail})", chrono::Utc::now().to_rfc3339());
                 break;
             }
         }
@@ -905,7 +933,27 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
                 .as_ref()
                 .map(VirtualMux::address)
                 .ok_or_else(|| ApiError::new(409, "Device relay is not ready"))?;
-            let mut receiver = s.mjpeg.subscribe(address, s.cancel.clone()).await;
+            let session = Arc::downgrade(&s);
+            let mut receiver = s
+                .mjpeg
+                .subscribe(address, s.cancel.clone(), move || {
+                    let session = session.clone();
+                    async move {
+                        let session = session.upgrade().ok_or_else(|| anyhow::anyhow!("Session closed"))?;
+                        let controller = session.ready().await?;
+                        let response = controller
+                            .request(json!({"op":"preview_prepare"}), Duration::from_secs(30), session.cancel.clone())
+                            .await?;
+                        let prepared =
+                            response["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok());
+                        anyhow::ensure!(
+                            response["kind"] == "text" && prepared.is_some_and(|value| value["mjpegPrepared"] == true),
+                            "MJPEG limits were not acknowledged"
+                        );
+                        Ok(())
+                    }
+                })
+                .await;
             let first = tokio::select! {
                 biased;
                 _ = s.cancel.cancelled() => return Err(ApiError::new(410, "Session closed")),

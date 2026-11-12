@@ -57,6 +57,7 @@ COPY --from=wda /out/WDA-unsigned.ipa /usr/share/iphone-control/WDA-unsigned.ipa
 COPY --from=wda /out/licenses/ /usr/share/licenses/
 COPY LICENSE THIRD_PARTY.md /usr/share/doc/iphone-control/
 COPY --from=notices /THIRD_PARTY_LICENSES.html /usr/share/doc/iphone-control/THIRD_PARTY_LICENSES.html
+COPY vendor/jktcp/LICENSE /usr/share/licenses/jktcp/LICENSE
 COPY vendor/plume_core/LICENSE /usr/share/licenses/plume_core/LICENSE
 COPY vendor/plume_store/LICENSE-MIT-Impactor /usr/share/licenses/plume_store/LICENSE
 COPY vendor/omnisette/LICENSE /usr/share/licenses/omnisette/LICENSE

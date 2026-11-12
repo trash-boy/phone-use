@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, rm, readdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -952,6 +952,63 @@ contract('MJPEG descriptor requires session credentials and preview ticket canno
   assert.equal((await app.api(url, '', undefined, { Origin: 'https://evil.test' })).status, 403);
   await app.api(route, session.token, undefined, {}, 'DELETE');
   assert.ok([401, 404].includes((await app.api(url, '')).status));
+});
+
+contract('MJPEG waits for acknowledged source limits before opening 9100 and fails to screenshot fallback', async t => {
+  for (const mode of ['acknowledged', 'rejected', 'unacknowledged', 'reconnect-rejected']) {
+    await t.test(mode, async t => {
+      const dir = await mkdtemp(path.join(tmpdir(), 'mjpeg-prepare-'));
+      t.after(() => rm(dir, { recursive: true, force: true }));
+      const log = path.join(dir, 'requests.log');
+      const app = await harness(t, { FIXTURE_REQUEST_LOG: log, FIXTURE_PREVIEW_PREPARE_DELAY_MS: '100',
+        ...(mode === 'rejected' ? { FIXTURE_PREVIEW_PREPARE_ERROR: '1' } : {}),
+        ...(mode === 'unacknowledged' ? { FIXTURE_PREVIEW_PREPARE_UNACKNOWLEDGED: '1' } : {}),
+        ...(mode === 'reconnect-rejected' ? { FIXTURE_PREVIEW_PREPARE_ERROR_AFTER: '1' } : {}),
+      });
+      const session = await app.session();
+      const ws = new WebSocket(session.relayUrl, { origin });
+      const ports = new Map(), openChecks = [];
+      ws.on('message', bytes => {
+        const f = decodeFrame(bytes);
+        if (f.type === F.OpenStream) {
+          const port = JSON.parse(f.payload).port;
+          ports.set(f.streamId, port);
+          if (port === 9100) openChecks.push(readFile(log, 'utf8'));
+          ws.send(encodeFrame({ type: F.OpenResult, requestId: f.requestId, streamId: f.streamId, payload: jsonPayload({ ok: true }) }));
+        }
+        if (f.type === F.StreamData && ports.get(f.streamId) === 9100) {
+          ws.send(encodeFrame({ type: F.StreamData, streamId: f.streamId, payload: Buffer.from(
+            'HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9', 'latin1') }));
+        }
+      });
+      t.after(() => ws.terminate());
+      await once(ws, 'open'); ws.send(encodeFrame({ type: F.DeviceHello, payload: jsonPayload(device) }));
+      await ready(app, session);
+      const route = `/api/sessions/${session.id}`;
+      const descriptor = await (await app.api(route + '/preview/stream', session.token)).json();
+      await app.api(route, session.token);
+      assert.ok(!(await readFile(log, 'utf8')).includes('preview_prepare'), 'status and descriptor must not create WDA sessions');
+      const response = await fetch(app.base + descriptor.url);
+      if (mode === 'acknowledged' || mode === 'reconnect-rejected') {
+        assert.equal(response.status, 200);
+        assert.equal(openChecks.length, 1);
+        assert.match(await openChecks[0], /preview_prepare\npreview_prepare_ack\n/);
+        if (mode === 'reconnect-rejected') {
+          const reader = response.body.getReader();
+          assert.ok(!(await reader.read()).done);
+          const streamId = [...ports].find(([, port]) => port === 9100)[0];
+          ws.send(encodeFrame({ type: F.StreamClose, streamId }));
+          assert.equal((await reader.read()).done, true, 'failed reconfiguration must end an existing stream');
+          assert.equal((await readFile(log, 'utf8')).split('\n').filter(op => op === 'preview_prepare').length, 2);
+          assert.equal(openChecks.length, 1, 'reconnect must not open 9100 when WDA settings reset');
+        } else await response.body.cancel();
+      } else {
+        assert.equal(response.status, 503);
+        assert.match(await response.text(), /screenshot preview/);
+        assert.equal(openChecks.length, 0, 'rejected or missing settings acknowledgement must never open 9100');
+      }
+    });
+  }
 });
 
 contract('task permits one hundred actions then completion, and blocks action 101', async t => {

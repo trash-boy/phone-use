@@ -46,6 +46,8 @@ pub fn default_socket() -> PathBuf {
 pub enum Request {
     /// MCP 的 iphone_status：与 toolkit 相同的文字
     Status,
+    /// Internal preview barrier: confirm source-side MJPEG limits before opening 9100.
+    PreviewPrepare,
     /// 区域单位为点；None 表示整屏
     Screenshot {
         region: Option<(f64, f64, f64, f64)>,

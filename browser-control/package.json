@@ -7,6 +7,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-device-install.mjs",
+    "prebuild": "node scripts/patch-device-install.mjs",
+    "prebuild:assets": "node scripts/patch-device-install.mjs",
+    "preweb:dev": "node scripts/patch-device-install.mjs",
     "test": "node --test tests/*.test.mjs",
     "dev": "sh scripts/start-gateway.sh",
     "start": "sh scripts/start-gateway.sh",

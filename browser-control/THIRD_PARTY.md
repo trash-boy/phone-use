@@ -4,7 +4,7 @@ Project additions are covered by the repository [MIT license](../LICENSE). Exist
 
 | Component | Pinned version/source | License/reuse |
 |---|---|---|
-| [@limrun/device-install](https://www.npmjs.com/package/@limrun/device-install/v/0.1.0) | 0.1.0; installed package metadata | MIT as declared by this published package; imported public USB chooser, pairing, relay close and IndexedDB store APIs. No USB protocol code copied or changed. |
+| [@limrun/device-install](https://www.npmjs.com/package/@limrun/device-install/v/0.1.0) | 0.1.0; installed package metadata | MIT as declared by this published package; imported USB chooser, pairing, relay and IndexedDB store APIs. The browser ESM build receives the local stream lifecycle patch described below. |
 | [iphone-control PR #34](https://github.com/Derrors/iphone-control/pull/34) | commit [ff78e757](https://github.com/Derrors/iphone-control/commit/ff78e757) | MIT; `web/interaction.mjs` adapts object-fit screenshot coordinate conversion and pointer tap/swipe/long-press behavior. Copyright (c) 2026 iphone-control contributors. |
 | Leptos | 0.8.23 | MIT; Rust/WASM client-rendered UI. Rust dependency metadata is pinned in the root Cargo.lock. |
 | wasm-bindgen / web-sys | 0.2.130 / 0.3.107 | MIT OR Apache-2.0; generated browser bindings and DOM/browser API access. |
@@ -13,6 +13,8 @@ Project additions are covered by the repository [MIT license](../LICENSE). Exist
 | Vite / Playwright | package-lock.json | Build/test dependencies retain their package licenses; the browser runtime image contains compiled assets. |
 
 The published device-install package declares MIT and omits a LICENSE file in its npm tarball. The current [typescript-sdk repository root license](https://github.com/limrun-inc/typescript-sdk/blob/main/LICENSE) is Apache-2.0 (Copyright 2026 Limrun). This report distinguishes published artifact metadata from the repository's license; it does not describe the entire upstream repository as MIT. Upstream licensing clarification should accompany redistribution beyond this source implementation.
+
+`scripts/patch-device-install.mjs` modifies only the pinned browser ESM chunk at install/build time. It validates the original SHA-256, releases local streams with RST/ACK, handles peer FIN/RST, wakes pending readers and cancels pending connection opens. The v2 patch also buffers fragmented usbmux packets, retains surplus packets and validates packet/TCP header lengths with a 64 KiB receive limit; it authenticates and upgrades the prior v1 patch. Re-running verifies and reapplies the exact same patch. A changed package version or chunk fails the build and requires review. CommonJS consumers are outside this browser-only patch. The upstream package is downloaded by npm rather than vendored here; its existing copyright and license notices remain applicable.
 
 MIT permission text (published package metadata and adapted MIT interaction code):
 

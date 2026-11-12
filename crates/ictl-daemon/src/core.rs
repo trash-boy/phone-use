@@ -531,6 +531,14 @@ impl Daemon {
         let mut outcome = crate::protocol::Outcome::default();
         let r = match req {
             Request::Status => Ok(self.status_text(g).await),
+            Request::PreviewPrepare => match self.require_wda(g) {
+                Ok(wda) => wda
+                    .prepare_mjpeg()
+                    .await
+                    .map(|()| serde_json::json!({"mjpegPrepared":true}).to_string())
+                    .map_err(|e| e.to_string()),
+                Err(error) => Err(error),
+            },
             Request::Screenshot { region } => {
                 let resp = self.screenshot(g, region).await.unwrap_or_else(Response::error);
                 self.publish(g);

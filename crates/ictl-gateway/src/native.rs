@@ -19,6 +19,7 @@ use crate::identity::Device;
 
 const MAX_RESPONSE: usize = 12 * 1024 * 1024;
 const MAX_TRANSCRIPT: usize = 32 * 1024;
+const MAX_DAEMON_LOG: u64 = 5 * 1024 * 1024;
 
 struct Group {
     pid: i32,
@@ -139,10 +140,10 @@ impl NativeController {
             }
         };
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(drain(stdout));
+            tokio::spawn(drain(stdout, self.0.data_dir.join("logs/daemon.stdout.log")));
         }
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain(stderr));
+            tokio::spawn(drain(stderr, self.0.data_dir.join("logs/daemon.stderr.log")));
         }
         let controller = self.clone();
         tokio::spawn(async move {
@@ -368,9 +369,34 @@ impl NativeController {
     }
 }
 
-async fn drain(mut input: impl AsyncRead + Unpin) {
+async fn drain(mut input: impl AsyncRead + Unpin, path: PathBuf) {
+    // Continue draining even if logging fails: a full pipe must never stop the daemon.
+    let mut logging = true;
     let mut buffer = [0; 8192];
-    while matches!(input.read(&mut buffer).await, Ok(length) if length > 0) {}
+    while let Ok(length) = input.read(&mut buffer).await {
+        if length == 0 {
+            break;
+        }
+        if logging && let Err(error) = append_daemon_log(&path, &buffer[..length]).await {
+            eprintln!("Could not persist native daemon diagnostics: {error}");
+            logging = false;
+        }
+    }
+}
+
+async fn append_daemon_log(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let length = tokio::fs::metadata(path).await.map(|meta| meta.len()).unwrap_or(0);
+    if length + bytes.len() as u64 > MAX_DAEMON_LOG {
+        tokio::fs::rename(path, path.with_extension("log.1")).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).await?;
+    file.write_all(bytes).await?;
+    // Tokio may still have a blocking write in flight after write_all returns.
+    // Finish it before dropping the handle or reading/rotating this path again.
+    file.flush().await
 }
 
 fn signal_group(pid: i32, signal: i32) -> Result<()> {
@@ -420,6 +446,35 @@ async fn stop_group(group: &Group) -> Result<()> {
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn daemon_diagnostics_are_private_and_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/daemon.stderr.log");
+        append_daemon_log(&path, b"runner started\n").await.unwrap();
+        let file = tokio::fs::OpenOptions::new().write(true).open(&path).await.unwrap();
+        file.set_len(MAX_DAEMON_LOG).await.unwrap();
+        append_daemon_log(&path, b"runner disconnected\n").await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"runner disconnected\n");
+        assert_eq!(tokio::fs::metadata(path.with_extension("log.1")).await.unwrap().len(), MAX_DAEMON_LOG);
+        assert_eq!(tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn failed_diagnostics_still_drain_the_child_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        tokio::fs::write(&blocked, b"blocked").await.unwrap();
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let drain = tokio::spawn(drain(reader, blocked.join("daemon.log")));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            writer.write_all(&vec![b'x'; 32 * 1024]).await.unwrap();
+            drop(writer);
+            drain.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     fn controller(socket: PathBuf, cancel: CancellationToken) -> NativeController {
         NativeController::new(

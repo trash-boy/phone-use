@@ -29,6 +29,9 @@ jobs:
       # --all-features：默认不编的 debug-cmds（调试子命令）也要能编译
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
+      # Software TCP regressions use synthetic transports; upstream TUN demos need root/devices.
+      - name: software TCP cancellation and WAN timer regressions
+        run: cargo test --locked --manifest-path vendor/jktcp/Cargo.toml --lib -- --skip tests::local_tcp --skip tests::handle_speed
 
   # macOS（Apple Silicon）上能编译、测试通过；格式和平台无关，上面已经查过
   macos:
@@ -42,6 +45,9 @@ jobs:
       # --all-features：默认不编的 debug-cmds（调试子命令）也要能编译
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
+      # Software TCP regressions use synthetic transports; upstream TUN demos need root/devices.
+      - name: software TCP cancellation and WAN timer regressions
+        run: cargo test --locked --manifest-path vendor/jktcp/Cargo.toml --lib -- --skip tests::local_tcp --skip tests::handle_speed
 
   # Cargo.toml 声明的最低版本（rust-version）要真能编译
   msrv:

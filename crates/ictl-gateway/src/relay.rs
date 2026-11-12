@@ -53,7 +53,8 @@ impl Frame {
 struct Entry {
     opened: bool,
     result: Option<oneshot::Sender<bool>>,
-    incoming: mpsc::Sender<Vec<u8>>,
+    // Dropping the sender marks peer EOF; the receiver drains queued bytes first.
+    incoming: Option<mpsc::Sender<Vec<u8>>>,
     queued: Arc<AtomicUsize>,
     cancel: CancellationToken,
 }
@@ -119,7 +120,7 @@ impl Relay {
                 Entry {
                     opened: false,
                     result: Some(result_tx),
-                    incoming: incoming_tx,
+                    incoming: Some(incoming_tx),
                     queued: queued.clone(),
                     cancel: cancel.clone(),
                 },
@@ -164,7 +165,9 @@ impl Relay {
                 Ok(())
             }
             .await;
-            let _ = result;
+            if result.is_ok() {
+                let _ = write.shutdown().await;
+            }
             inbound_relay.retire(id, false).await;
         });
         let outbound_relay = self.clone();
@@ -229,6 +232,7 @@ impl Relay {
                 if !entry.opened {
                     bail!("Unknown or unopened stream");
                 }
+                let Some(incoming) = entry.incoming.as_ref() else { return Ok(()) };
                 let length = frame.payload.len();
                 let previous = entry.queued.fetch_add(length, Ordering::AcqRel);
                 // The duplex has STREAM_BUFFER bytes in addition to the queue.
@@ -236,7 +240,7 @@ impl Relay {
                     entry.queued.fetch_sub(length, Ordering::AcqRel);
                     bail!("Stream receive buffer exceeded");
                 }
-                if entry.incoming.try_send(frame.payload).is_err() {
+                if incoming.try_send(frame.payload).is_err() {
                     entry.queued.fetch_sub(length, Ordering::AcqRel);
                     bail!("Stream receive buffer exceeded");
                 }
@@ -245,8 +249,15 @@ impl Relay {
                 if frame.request_id != 0 {
                     bail!("Invalid StreamClose");
                 }
-                if let Some(entry) = streams.entries.remove(&frame.stream_id) {
-                    entry.cancel.cancel();
+                if let Some(entry) = streams.entries.get_mut(&frame.stream_id) {
+                    if entry.opened {
+                        // Data and Close arrive in order, but the receive pump may
+                        // not have run yet. Drain before EOF; session cancellation
+                        // can still interrupt a stalled reader immediately.
+                        entry.incoming.take();
+                    } else if let Some(entry) = streams.entries.remove(&frame.stream_id) {
+                        entry.cancel.cancel();
+                    }
                 }
             }
             _ => bail!("Unsupported stream frame"),
@@ -332,5 +343,73 @@ mod tests {
         assert!(relay.handle(Frame { kind: 5, request_id: 0, stream_id: 100, payload: vec![] }).await.is_err());
         relay.close().await;
         assert!(opening.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_close_drains_final_bytes_before_eof_even_under_backpressure() {
+        for length in [19, STREAM_BUFFER * 3] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let relay = Relay::new(tx, CancellationToken::new());
+            let opening = tokio::spawn({
+                let relay = relay.clone();
+                async move { relay.open(8100).await }
+            });
+            let id = rx.recv().await.unwrap().stream_id;
+            relay.handle(Frame::json(3, id, id, &json!({"ok":true}))).await.unwrap();
+            let mut stream = opening.await.unwrap().unwrap();
+            let expected = vec![42; length];
+            // No yield between Data and Close: the receive pump has not run yet.
+            for chunk in expected.chunks(MAX_USB_DATA) {
+                relay.handle(Frame { kind: 4, request_id: 0, stream_id: id, payload: chunk.to_vec() }).await.unwrap();
+            }
+            relay.handle(Frame { kind: 5, request_id: 0, stream_id: id, payload: vec![] }).await.unwrap();
+            // Duplicate Close and late Data cannot revive or append to the stream.
+            relay.handle(Frame { kind: 5, request_id: 0, stream_id: id, payload: vec![] }).await.unwrap();
+            relay.handle(Frame { kind: 4, request_id: 0, stream_id: id, payload: vec![99] }).await.unwrap();
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut received)).await.unwrap().unwrap();
+            assert_eq!(received, expected);
+            assert!(relay.0.streams.lock().await.entries.is_empty());
+            relay.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_cancel_interrupts_a_peer_close_blocked_on_a_full_buffer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let relay = Relay::new(tx, CancellationToken::new());
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let id = rx.recv().await.unwrap().stream_id;
+        relay.handle(Frame::json(3, id, id, &json!({"ok":true}))).await.unwrap();
+        let mut stream = opening.await.unwrap().unwrap();
+        relay
+            .handle(Frame { kind: 4, request_id: 0, stream_id: id, payload: vec![7; STREAM_BUFFER * 2] })
+            .await
+            .unwrap();
+        relay.handle(Frame { kind: 5, request_id: 0, stream_id: id, payload: vec![] }).await.unwrap();
+        tokio::task::yield_now().await;
+        relay.close().await;
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut received)).await.unwrap().unwrap();
+        assert!(received.len() <= STREAM_BUFFER);
+        assert!(relay.0.streams.lock().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_close_cancels_an_unfinished_open() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let relay = Relay::new(tx, CancellationToken::new());
+        let opening = tokio::spawn({
+            let relay = relay.clone();
+            async move { relay.open(8100).await }
+        });
+        let id = rx.recv().await.unwrap().stream_id;
+        relay.handle(Frame { kind: 5, request_id: 0, stream_id: id, payload: vec![] }).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), opening).await.unwrap().unwrap().is_err());
+        assert!(relay.0.streams.lock().await.entries.is_empty());
+        relay.close().await;
     }
 }

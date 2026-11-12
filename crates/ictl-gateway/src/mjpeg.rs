@@ -6,7 +6,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::{
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -85,15 +85,19 @@ pub(crate) struct Frame {
     at: Instant,
     sequence: u64,
 }
+type FrameSender = watch::Sender<Option<Arc<Frame>>>;
+
 #[derive(Default)]
 pub struct Preview {
-    sender: Mutex<Option<watch::Sender<Option<Arc<Frame>>>>>,
+    // Only the reader task owns the sender. Its exit must close HTTP responses
+    // immediately, including when the source settings cannot be acknowledged.
+    sender: Mutex<Option<Weak<FrameSender>>>,
 }
 
 impl Preview {
     pub async fn status(&self) -> Value {
         let sender = self.sender.lock().await;
-        let frame = sender.as_ref().and_then(|s| s.borrow().clone());
+        let frame = sender.as_ref().and_then(Weak::upgrade).and_then(|s| s.borrow().clone());
         match frame {
             Some(frame) => {
                 json!({"state":"streaming","ageMs":frame.at.elapsed().as_millis() as u64,"frames":frame.sequence,"frameBytes":frame.bytes.len()})
@@ -101,20 +105,39 @@ impl Preview {
             None => json!({"state":"waiting"}),
         }
     }
-    pub(crate) async fn subscribe(
+    pub(crate) async fn subscribe<F, Fut>(
         &self,
         address: String,
         cancel: CancellationToken,
-    ) -> watch::Receiver<Option<Arc<Frame>>> {
+        prepare: F,
+    ) -> watch::Receiver<Option<Arc<Frame>>>
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
         let mut current = self.sender.lock().await;
-        if let Some(sender) = current.as_ref().filter(|s| s.receiver_count() > 0) {
+        if let Some(sender) = current.as_ref().and_then(Weak::upgrade).filter(|s| s.receiver_count() > 0) {
             return sender.subscribe();
         }
         let (sender, receiver) = watch::channel(None);
-        *current = Some(sender.clone());
+        let sender = Arc::new(sender);
+        *current = Some(Arc::downgrade(&sender));
         tokio::spawn(async move {
             let mut sequence = 0;
             loop {
+                // Gate every connection, not just the first subscriber: a WDA
+                // restart resets its process-wide MJPEG limits to the defaults.
+                let prepared = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = sender.closed() => break,
+                    result = prepare() => result,
+                };
+                if prepared.is_err() {
+                    // Dropping the channel ends an existing response or makes
+                    // the first-frame wait fail immediately for screenshot fallback.
+                    break;
+                }
                 let capture = async {
                     let mut socket =
                         tokio::time::timeout(FRAME_TIMEOUT, crate::mux::connect_port(&address, 9100)).await??;
@@ -182,6 +205,64 @@ pub(crate) fn response(receiver: watch::Receiver<Option<Arc<Frame>>>, cancel: Ca
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn rejected_preparation_closes_waiters_without_connecting_or_retrying() {
+        let preview = Preview::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut receiver = preview
+            .subscribe("invalid-mux-address".into(), CancellationToken::new(), move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { anyhow::bail!("settings rejected") }
+            })
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.wait_for(|f| f.is_some()))
+                .await
+                .expect("failed preparation must promptly close the preview")
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(preview.status().await["state"], "waiting");
+    }
+
+    #[tokio::test]
+    async fn disconnecting_the_last_subscriber_cancels_pending_preparation() {
+        struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preview = Preview::default();
+        let receiver = preview
+            .subscribe("invalid-mux-address".into(), CancellationToken::new(), {
+                let started = started.clone();
+                let dropped = dropped.clone();
+                move || {
+                    let started = started.clone();
+                    let dropped = dropped.clone();
+                    async move {
+                        let _on_drop = OnDrop(dropped);
+                        started.notify_one();
+                        std::future::pending::<Result<()>>().await
+                    }
+                }
+            })
+            .await;
+        tokio::time::timeout(Duration::from_millis(200), started.notified()).await.unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("no preview task may retain a pending native request after the client disconnects");
+    }
 
     #[tokio::test]
     async fn reads_fragmented_frames_without_waiting_for_the_next_boundary() {

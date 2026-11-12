@@ -231,6 +231,29 @@ impl<T: Transport> WdaClient<T> {
         unreachable!()
     }
 
+    /// Configure at the source before opening port 9100. A status probe does not
+    /// create a WDA session, and the default full-size 10 fps stream can saturate
+    /// a remote USB relay before the first interactive command applies settings.
+    /// Revalidate on every stream connection, including after WDA restarts.
+    pub async fn prepare_mjpeg(&mut self) -> Result<()> {
+        let settings = json!({"mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40});
+        let response =
+            self.in_session("POST", "/appium/settings", Some(json!({"settings":settings})), DEFAULT_TIMEOUT).await?;
+        if ![("mjpegServerFramerate", 3.0), ("mjpegScalingFactor", 50.0), ("mjpegServerScreenshotQuality", 40.0)]
+            .iter()
+            .all(|(name, expected)| response[*name].as_f64() == Some(*expected))
+        {
+            return Err(WdaError::Unavailable(
+                ictl_l10n::tr!(
+                    "WDA 未确认 MJPEG 限流设置，使用截图预览",
+                    "WDA did not acknowledge MJPEG limits; use screenshot preview"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn post(&mut self, path: &str, body: Value) -> Result<Value> {
         self.in_session("POST", path, Some(body), DEFAULT_TIMEOUT).await
     }
@@ -800,6 +823,79 @@ mod tests {
         assert_eq!(profile["settings"]["mjpegServerFramerate"], 3);
         assert_eq!(profile["settings"]["mjpegScalingFactor"], 50);
         assert_eq!(profile["settings"]["mjpegServerScreenshotQuality"], 40);
+    }
+
+    #[tokio::test]
+    async fn prepare_mjpeg_creates_one_session_and_verifies_limits_on_every_connection() {
+        let limits =
+            r#"{"value":{"mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40}}"#;
+        let m = Mock::with(&[
+            (200, r#"{"value":{"ready":true}}"#),
+            (200, r#"{"value":{"ready":true}}"#),
+            (200, r#"{"sessionId":"A"}"#),
+            (200, limits),
+            (200, limits),
+        ]);
+        let mut client = WdaClient::new(&m);
+        assert!(client.ready().await.unwrap());
+        assert!(client.ready().await.unwrap());
+        assert!(client.session.is_none(), "health polling must not create sessions");
+        client.prepare_mjpeg().await.unwrap();
+        client.prepare_mjpeg().await.unwrap();
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            ["/status", "/status", "/session", "/session/A/appium/settings", "/session/A/appium/settings"]
+        );
+        for request in &seen[3..] {
+            let body: Value = serde_json::from_str(request.2.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body["settings"],
+                json!({"mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_mjpeg_rejects_missing_wrong_or_failed_limit_acknowledgements() {
+        for reply in [
+            (200, r#"{"value":{"mjpegServerFramerate":3,"mjpegScalingFactor":50}}"#),
+            (200, r#"{"value":{"mjpegServerFramerate":10,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40}}"#),
+            (200, r#"{"value":{"mjpegServerFramerate":3,"mjpegScalingFactor":100,"mjpegServerScreenshotQuality":40}}"#),
+            (200, r#"{"value":{"mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":25}}"#),
+            (400, r#"{"value":{"error":"invalid argument","message":"unsupported setting"}}"#),
+        ] {
+            let m = Mock::with(&[(200, r#"{"sessionId":"A"}"#), reply]);
+            assert!(WdaClient::new(&m).prepare_mjpeg().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_mjpeg_recreates_a_stale_session_before_acknowledging_limits() {
+        let limits =
+            r#"{"value":{"mjpegServerFramerate":3,"mjpegScalingFactor":50,"mjpegServerScreenshotQuality":40}}"#;
+        let m = Mock::with(&[
+            (200, r#"{"sessionId":"A"}"#),
+            (200, limits),
+            (404, r#"{"value":{"error":"invalid session id","message":"restarted"}}"#),
+            (200, r#"{"sessionId":"B"}"#),
+            (200, limits),
+        ]);
+        let mut client = WdaClient::new(&m);
+        client.prepare_mjpeg().await.unwrap();
+        client.prepare_mjpeg().await.unwrap();
+        assert_eq!(client.session.as_deref(), Some("B"));
+        let seen = m.seen.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            [
+                "/session",
+                "/session/A/appium/settings",
+                "/session/A/appium/settings",
+                "/session",
+                "/session/B/appium/settings"
+            ]
+        );
     }
 
     #[tokio::test]

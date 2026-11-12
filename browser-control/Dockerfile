@@ -48,6 +48,7 @@ FROM node:22-trixie-slim AS web-build
 ARG WEB_BASE=/
 WORKDIR /web
 COPY browser-control/package.json browser-control/package-lock.json ./
+COPY browser-control/scripts/patch-device-install.mjs ./scripts/patch-device-install.mjs
 RUN npm ci
 COPY browser-control/ ./
 COPY --from=wasm-build /src/browser-control/pkg/ ./pkg/
@@ -65,6 +66,8 @@ COPY --from=assets /usr/share/doc/iphone-control/ /usr/share/doc/iphone-control/
 COPY --from=gateway-notices /GATEWAY_LICENSES.html /usr/share/doc/iphone-control/GATEWAY_LICENSES.html
 COPY --from=web-build /web/dist/ ./dist/
 COPY --from=gateway-notices /WEB_LICENSES.html ./dist/licenses/rust-wasm.html
+COPY vendor/jktcp/LICENSE /usr/share/licenses/jktcp/LICENSE
+COPY THIRD_PARTY.md /usr/share/doc/iphone-control/THIRD_PARTY.md
 COPY LICENSE ./LICENSE
 COPY browser-control/THIRD_PARTY.md ./THIRD_PARTY.md
 RUN mkdir -p /app/.runtime && chown -R control:control /app
