@@ -430,8 +430,8 @@ class CodexBridge(Bridge):
             options += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
         for feature in CODEX_DISABLED_FEATURES:
             options += ["--disable", feature]
-        model = self.default_model if model == "default" and self.default_model else model
-        if model != "default":
+        model = self.resolve_model(model)
+        if model:
             options += ["-m", model]
         for image in images:
             options += ["-i", image]
@@ -496,6 +496,22 @@ class CodexBridge(Bridge):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+    def current_thread(self, session):
+        return self.threads.get(session) if session else None
+
+    async def first_turn(self, model, system, text, images, reader):
+        """Start a thread with the full rules; returns (thread id, result)."""
+        return await self.run(self.command(model, None, images), f"{CODEX_ROLE}\n\n{system}\n\n{text}", reader)
+
+    async def next_turn(self, model, thread, text, images, reader):
+        _, result = await self.run(self.command(model, thread, images), f"{CODEX_FOLLOW_UP}\n\n{text}", reader)
+        return result
+
+    def resolve_model(self, model):
+        """The explicit model to request, or None to keep the CLI's own."""
+        model = self.default_model if model == "default" and self.default_model else model
+        return None if model == "default" else model
+
     def remember(self, session, thread):
         self.threads.pop(session, None)
         self.threads[session] = thread
@@ -525,11 +541,10 @@ class CodexBridge(Bridge):
             text = "\n\n".join(texts)
             lock = self.locks.setdefault(session, asyncio.Lock()) if session else asyncio.Lock()
             async with lock:
-                thread = self.threads.get(session) if session else None
+                thread = self.current_thread(session)
                 if thread:
                     try:
-                        _, result = await self.run(self.command(model, thread, images),
-                                                   f"{CODEX_FOLLOW_UP}\n\n{text}", reader)
+                        result = await self.next_turn(model, thread, text, images, reader)
                         self.remember(session, thread)
                         return result
                     except BridgeError as exc:
@@ -537,14 +552,221 @@ class CodexBridge(Bridge):
                             raise
                         # The thread may be gone: start a fresh one with the full rules.
                         self.threads.pop(session, None)
-                started, result = await self.run(self.command(model, None, images),
-                                                  f"{CODEX_ROLE}\n\n{system}\n\n{text}", reader)
+                started, result = await self.first_turn(model, system, text, images, reader)
                 if session and started:
                     self.remember(session, started)
                 return result
         finally:
             shutil.rmtree(images_dir, ignore_errors=True)
             self.active -= 1
+
+
+class AppServer:
+    """One long-lived `codex app-server` over stdio JSON-RPC, so steps skip CLI startup."""
+
+    def __init__(self, command, cwd):
+        self.command = command
+        self.cwd = cwd
+        self.proc = None
+        self.reader = None
+        self.pending = {}
+        self.turns = {}  # thread id -> queue of notifications for the running turn
+        self.next_id = 0
+        self.generation = 0
+        self.lock = asyncio.Lock()
+
+    def running(self):
+        return self.proc is not None and self.proc.returncode is None and self.reader is not None and not self.reader.done()
+
+    async def ensure(self):
+        async with self.lock:
+            if self.running():
+                return
+            await self.stop()
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *self.command, cwd=self.cwd, start_new_session=True, limit=MAX_OUTPUT,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+            except (OSError, ValueError):
+                raise BridgeError(502, "Could not start Codex") from None
+            self.generation += 1
+            self.reader = asyncio.create_task(self.read())
+            await self.call("initialize", {"clientInfo": {"name": "phone-use-bridge", "version": "1"}})
+            await self.send({"jsonrpc": "2.0", "method": "initialized"})
+
+    async def send(self, message):
+        try:
+            self.proc.stdin.write((json.dumps(message) + "\n").encode())
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, AttributeError):
+            raise BridgeError(502, "Codex app-server exited") from None
+
+    async def call(self, method, params, timeout=30):
+        self.next_id += 1
+        request_id = self.next_id
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            message = await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            raise BridgeError(504, "Codex request timed out") from None
+        finally:
+            self.pending.pop(request_id, None)
+        if "error" in message or not isinstance(message.get("result"), dict):
+            raise BridgeError(502, "Codex request failed")
+        return message["result"]
+
+    async def read(self):
+        try:
+            while True:
+                try:
+                    line = await self.proc.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    break  # An oversized message: drop this server rather than misparse the stream.
+                if not line:
+                    break
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if "id" in message and "method" in message:
+                    # Approvals and other server requests: tools are disabled, so refuse.
+                    await self.send({"jsonrpc": "2.0", "id": message["id"],
+                                     "error": {"code": -32601, "message": "Not supported by the phone-use bridge"}})
+                elif "id" in message:
+                    future = self.pending.get(message["id"])
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                else:
+                    params = message.get("params")
+                    queue = self.turns.get(params.get("threadId")) if isinstance(params, dict) else None
+                    if queue is not None:
+                        queue.put_nowait(message)
+        except (BridgeError, ConnectionError, OSError):
+            pass
+        finally:
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(BridgeError(502, "Codex app-server exited"))
+            for queue in self.turns.values():
+                queue.put_nowait(None)
+
+    async def stop(self):
+        proc, reader = self.proc, self.reader
+        self.proc = self.reader = None
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+        if reader is not None:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+
+class CodexAppBridge(CodexBridge):
+    """Codex engine over one long-lived app-server: about 1.9 s per step instead of 3 s or more."""
+
+    def __init__(self, codex_bin, work_dir, timeout=TIMEOUT, default_model=None, reasoning_effort="low"):
+        super().__init__(codex_bin, work_dir, timeout, default_model, reasoning_effort)
+        options = ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        for feature in CODEX_DISABLED_FEATURES:
+            options += ["--disable", feature]
+        self.server = AppServer([codex_bin, "app-server", *options], self.work_dir)
+        self.thread_generation = {}
+
+    def current_thread(self, session):
+        thread = super().current_thread(session)
+        # Threads of a replaced server are unknown to the new one.
+        if thread and self.thread_generation.get(thread) != self.server.generation:
+            self.threads.pop(session, None)
+            return None
+        return thread
+
+    async def first_turn(self, model, system, text, images, reader):
+        await self.server.ensure()
+        params = {"cwd": self.work_dir, "sandbox": "read-only", "approvalPolicy": "never",
+                  "developerInstructions": f"{CODEX_ROLE}\n\n{system}"}
+        resolved = self.resolve_model(model)
+        if resolved:
+            params["model"] = resolved
+        started = await self.server.call("thread/start", params)
+        thread = started.get("thread", {}).get("id") if isinstance(started.get("thread"), dict) else None
+        if not isinstance(thread, str):
+            raise BridgeError(502, "Invalid Codex response")
+        self.thread_generation[thread] = self.server.generation
+        return thread, await self.turn(model, thread, text, images, reader)
+
+    async def next_turn(self, model, thread, text, images, reader):
+        await self.server.ensure()
+        return await self.turn(model, thread, f"{CODEX_FOLLOW_UP}\n\n{text}", images, reader)
+
+    async def turn(self, model, thread, text, images, reader):
+        queue = asyncio.Queue()
+        self.server.turns[thread] = queue
+        tasks = []
+        turn_id = None
+        try:
+            params = {"threadId": thread,
+                      "input": [{"type": "text", "text": text}] + [{"type": "localImage", "path": p} for p in images]}
+            resolved = self.resolve_model(model)
+            if resolved:
+                params["model"] = resolved
+            if self.reasoning_effort:
+                params["effort"] = self.reasoning_effort
+            started = await self.server.call("turn/start", params)
+            turn_id = started.get("turn", {}).get("id") if isinstance(started.get("turn"), dict) else None
+
+            async def completion():
+                message_text = None
+                while True:
+                    message = await queue.get()
+                    if message is None:
+                        raise BridgeError(502, "Codex app-server exited")
+                    method, payload = message.get("method"), message.get("params") or {}
+                    if method == "item/completed":
+                        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+                        if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
+                            message_text = item["text"]
+                    elif method == "turn/completed":
+                        status = payload.get("turn", {}).get("status") if isinstance(payload.get("turn"), dict) else None
+                        if status != "completed" or message_text is None:
+                            raise BridgeError(502, "Invalid Codex response")
+                        try:
+                            return {"reply": json_reply(message_text)}
+                        except ValueError:
+                            raise BridgeError(502, "Invalid Codex response") from None
+
+            work = asyncio.create_task(completion())
+            disconnected = asyncio.create_task(reader.read(1))
+            tasks = [work, disconnected]
+            done, _ = await asyncio.wait(tasks, timeout=self.timeout, return_when=asyncio.FIRST_COMPLETED)
+            if work in done:
+                return work.result()
+            if turn_id:
+                try:
+                    await self.server.call("turn/interrupt", {"threadId": thread, "turnId": turn_id}, timeout=5)
+                except BridgeError:
+                    pass
+            if disconnected in done:
+                raise BridgeError(499, "Client disconnected")
+            raise BridgeError(504, "Codex request timed out")
+        finally:
+            if self.server.turns.get(thread) is queue:
+                del self.server.turns[thread]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self):
+        await super().close()
+        await self.server.stop()
 
 
 def prepare_socket(path):
@@ -581,8 +803,9 @@ async def serve(args):
         raise ValueError("Work directory must be a dedicated empty directory")
     prepare_socket(args.socket)
     if args.codex_bin:
-        bridge = CodexBridge(args.codex_bin, work_dir, default_model=args.codex_model,
-                             reasoning_effort=args.reasoning_effort)
+        engine = CodexAppBridge if args.codex_mode == "app-server" else CodexBridge
+        bridge = engine(args.codex_bin, work_dir, default_model=args.codex_model,
+                        reasoning_effort=args.reasoning_effort)
     else:
         bridge = Bridge(args.claude_bin, work_dir)
     # Bind synchronously so no client can connect before permissions are restricted.
@@ -647,6 +870,8 @@ def main():
     parser.add_argument("--claude-bin", default="claude")
     parser.add_argument("--codex-bin", help="Plan with this Codex CLI instead of Claude Code")
     parser.add_argument("--codex-model", help="Codex model used when the gateway asks for `default`")
+    parser.add_argument("--codex-mode", choices=("app-server", "exec"), default="app-server",
+                        help="Keep one Codex app-server (default) or start `codex exec` for every step")
     parser.add_argument("--reasoning-effort", default="low",
                         help="Codex model_reasoning_effort for planning steps, or empty to keep the CLI's own")
     parser.add_argument("--work-dir", help="Dedicated empty absolute working directory (required unless --check)")

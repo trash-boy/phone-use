@@ -466,5 +466,121 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SECRET", json.dumps(result))
 
 
+FAKE_APP_SERVER = """#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+threads = {}
+def send(message):
+    sys.stdout.write(json.dumps(message) + '\\n')
+    sys.stdout.flush()
+for line in sys.stdin:
+    message = json.loads(line)
+    method, params, request_id = message.get('method'), message.get('params') or {}, message.get('id')
+    if method == 'initialize':
+        send({'id': request_id, 'result': {}})
+    elif method == 'thread/start':
+        thread = 'thread-%d' % (len(threads) + 1)
+        threads[thread] = params
+        send({'id': request_id, 'result': {'thread': {'id': thread}}})
+    elif method == 'turn/interrupt':
+        with open('interrupted', 'w') as f:
+            f.write(params['turnId'])
+        send({'id': request_id, 'result': {}})
+    elif method == 'turn/start':
+        thread = params['threadId']
+        text = params['input'][0]['text']
+        if 'CRASH' in text:
+            sys.exit(1)
+        send({'id': request_id, 'result': {'turn': {'id': 'turn-1'}}})
+        if 'SLOW' in text:
+            continue
+        images = [[i['path'], os.path.exists(i['path'])] for i in params['input'][1:]]
+        reply = {'argv': argv, 'pid': os.getpid(), 'thread': thread, 'start': threads.get(thread),
+                 'text': text, 'model': params.get('model'), 'effort': params.get('effort'), 'images': images}
+        send({'method': 'item/started', 'params': {'threadId': thread, 'item': {'type': 'reasoning'}}})
+        send({'method': 'item/completed', 'params': {'threadId': thread,
+              'item': {'type': 'agentMessage', 'text': json.dumps(reply)}}})
+        status = 'failed' if 'FAIL' in text else 'completed'
+        send({'method': 'turn/completed', 'params': {'threadId': thread, 'turn': {'id': 'turn-1', 'status': status}}})
+"""
+
+
+class CodexAppServerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.executable = self.root / "fake-codex"
+        self.executable.write_text(FAKE_APP_SERVER)
+        self.executable.chmod(0o700)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.path = self.root / "bridge.sock"
+        self.bridge = bridge.CodexAppBridge(str(self.executable), self.work, timeout=2, default_model="gpt-6-luna")
+        self.server = await asyncio.start_unix_server(self.bridge.handle, str(self.path), limit=bridge.MAX_HEADERS)
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+        await self.bridge.close()
+
+    async def plan(self, text="screen", session="s1", model="default", image=False):
+        content = [{"type": "text", "text": text}]
+        if image:
+            content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}})
+        body = json.dumps(dict(PLAN, model=model, session=session, content=content)).encode()
+        reader, writer = await asyncio.open_unix_connection(str(self.path))
+        writer.write(f"POST /plan HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), 6)
+        writer.close()
+        await writer.wait_closed()
+        header, payload = raw.split(b"\r\n\r\n", 1)
+        return int(header.split()[1]), json.loads(payload)
+
+    async def test_first_step_starts_a_read_only_thread_with_the_rules_as_instructions(self):
+        status, result = await self.plan(image=True)
+        self.assertEqual(status, 200, result)
+        reply = result["reply"]
+        self.assertEqual(reply["argv"][0], "app-server")
+        for value in ('sandbox_mode="read-only"', 'approval_policy="never"', "code_mode_host", "multi_agent"):
+            self.assertIn(value, reply["argv"])
+        start = reply["start"]
+        self.assertEqual((start["sandbox"], start["approvalPolicy"], start["model"]), ("read-only", "never", "gpt-6-luna"))
+        self.assertTrue(start["developerInstructions"].startswith(bridge.CODEX_ROLE))
+        self.assertIn(PLAN["system"], start["developerInstructions"])
+        self.assertEqual(reply["text"], "screen")
+        self.assertEqual((reply["model"], reply["effort"]), ("gpt-6-luna", "low"))
+        self.assertTrue(reply["images"][0][1], "the image existed during the turn")
+        self.assertEqual(list(self.work.iterdir()), [], "request images are removed afterwards")
+
+    async def test_later_steps_reuse_one_server_and_the_session_thread(self):
+        _, first = await self.plan()
+        _, second = await self.plan(model="gpt-6-sol")
+        self.assertEqual(second["reply"]["pid"], first["reply"]["pid"], "one long-lived app-server")
+        self.assertEqual(second["reply"]["thread"], first["reply"]["thread"])
+        self.assertTrue(second["reply"]["text"].startswith(bridge.CODEX_FOLLOW_UP))
+        self.assertEqual(second["reply"]["model"], "gpt-6-sol", "per-task model choice")
+        _, other = await self.plan(session="s2")
+        self.assertNotEqual(other["reply"]["thread"], first["reply"]["thread"])
+
+    async def test_a_crashed_server_is_restarted_with_new_threads(self):
+        _, first = await self.plan()
+        status, _ = await self.plan(text="CRASH")
+        self.assertEqual(status, 502)
+        status, after = await self.plan()
+        self.assertEqual(status, 200, after)
+        self.assertNotEqual(after["reply"]["pid"], first["reply"]["pid"])
+        self.assertIsNotNone(after["reply"]["start"], "a fresh thread on the new server")
+
+    async def test_failed_turns_and_timeouts_are_reported(self):
+        status, result = await self.plan(text="FAIL")
+        self.assertEqual(status, 502)
+        self.assertEqual(result, {"error": "Invalid Codex response"})
+        status, _ = await self.plan(text="SLOW", session="s3")
+        self.assertEqual(status, 504)
+        self.assertEqual((self.work / "interrupted").read_text(), "turn-1")
+
+
 if __name__ == "__main__":
     unittest.main()
