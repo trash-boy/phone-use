@@ -413,8 +413,12 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(value, args)
         self.assertNotIn("-m", args, "default keeps the CLI's own model")
         self.assertIn('model_reasoning_effort="low"', args)
-        self.assertTrue(reply["prompt"].startswith(PLAN["system"]))
+        self.assertTrue(reply["prompt"].startswith(bridge.CODEX_ROLE))
+        self.assertIn(PLAN["system"], reply["prompt"])
         self.assertTrue(reply["prompt"].endswith("screen"))
+        disabled = [args[i + 1] for i, a in enumerate(args) if a == "--disable"]
+        for feature in ("code_mode_host", "shell_tool", "multi_agent", "computer_use"):
+            self.assertIn(feature, disabled)
         self.assertEqual(len(reply["images"]), 1)
         self.assertTrue(reply["images"][0][1], "the image existed while Codex ran")
         self.assertFalse(Path(reply["images"][0][0]).exists(), "request images are removed afterwards")
@@ -436,7 +440,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         status, second = await self.plan(model="flaky")
         self.assertEqual(status, 200)
         self.assertNotIn("resume", second["reply"]["args"])
-        self.assertTrue(second["reply"]["prompt"].startswith(PLAN["system"]))
+        self.assertTrue(second["reply"]["prompt"].startswith(bridge.CODEX_ROLE))
         self.assertEqual(self.bridge.threads["s1"], second["reply"]["thread"])
         self.assertIn("-m", second["reply"]["args"])
 

@@ -28,8 +28,22 @@ TIMEOUT = 90
 # Gateway session ids name Codex threads; at most this many are remembered.
 SESSION_PATTERN = r"[A-Za-z0-9._:-]{1,128}"
 MAX_THREADS = 64
-CODEX_FOLLOW_UP = ("Next step of the same phone task. Follow the rules from the first message of this "
-                   "conversation and reply with exactly one JSON object and nothing else.")
+# Codex is an agent with its own tools. The phone tools named in the rules are run by the
+# gateway, not by Codex: with a small model it searched its own tools for them, found none and
+# replied that it could not control the phone. Say so, and disable the tool-providing features.
+CODEX_ROLE = ("ROLE: You are the planning brain of an external phone controller. You have NO tools: never call "
+              "any tool, function, shell, exec, search or sub-agent. Read the attached phone screenshot and the "
+              "text, then reply with exactly one JSON object describing the next step. The phone tools named in "
+              "the rules below (iphone_*) are executed by the controller, not by you, so they are always "
+              "available.")
+CODEX_FOLLOW_UP = ("Next step of the same phone task. You still have no tools; the controller executes the "
+                   "iphone_* action you choose. Follow the rules from the first message of this conversation "
+                   "and reply with exactly one JSON object and nothing else.")
+CODEX_DISABLED_FEATURES = (
+    "code_mode_host", "shell_tool", "unified_exec", "browser_use", "browser_use_external", "computer_use",
+    "apps", "multi_agent", "plugins", "skill_search", "image_generation", "sleep_tool", "tool_suggest",
+    "goals", "hooks", "view_image",
+)
 IMAGE_SUFFIX = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 # A pre-started CLI waits on stdin for the next step of the same task. Unused
 # ones are reclaimed after this long (a task step normally follows in seconds).
@@ -414,6 +428,8 @@ class CodexBridge(Bridge):
                    "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
         if self.reasoning_effort:
             options += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
+        for feature in CODEX_DISABLED_FEATURES:
+            options += ["--disable", feature]
         model = self.default_model if model == "default" and self.default_model else model
         if model != "default":
             options += ["-m", model]
@@ -521,7 +537,8 @@ class CodexBridge(Bridge):
                             raise
                         # The thread may be gone: start a fresh one with the full rules.
                         self.threads.pop(session, None)
-                started, result = await self.run(self.command(model, None, images), f"{system}\n\n{text}", reader)
+                started, result = await self.run(self.command(model, None, images),
+                                                  f"{CODEX_ROLE}\n\n{system}\n\n{text}", reader)
                 if session and started:
                     self.remember(session, started)
                 return result
