@@ -33,7 +33,7 @@ use crate::diagnostics::{Diagnostics, HealthDiagnostics};
 use crate::eventlog::EventLog;
 use crate::machine::{Backoff, DeviceState, LinkDown, Misses, MuxWatch};
 use crate::notify::{self, Dedup, Event};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, ThenView};
 use crate::supervise::StartOutcome;
 use ictl_wda::diagnostics::StopReason;
 
@@ -626,10 +626,7 @@ impl Daemon {
     /// 处理一个控制请求。`queued_at`：请求到达的时间，用来放弃排队太久的操作
     pub async fn handle(self: &Arc<Self>, req: Request, queued_at: Instant, ctx: CallCtx) -> Response {
         use tracing::Instrument;
-        let operation = serde_json::to_value(&req)
-            .ok()
-            .and_then(|value| value["op"].as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let operation = req.op();
         let operation_id = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
         let span = tracing::info_span!(
             "device_request",
@@ -656,7 +653,7 @@ impl Daemon {
         queued_at: Instant,
         ctx: CallCtx,
         operation_id: u64,
-        operation: String,
+        operation: &'static str,
     ) -> Response {
         // 不需要设备锁的请求
         match req {
@@ -692,7 +689,7 @@ impl Daemon {
             },
             None => self.inner.lock().await,
         };
-        let _active = Diagnostics::active(&self.diagnostics, operation_id, operation);
+        let _active = Diagnostics::active(&self.diagnostics, operation_id, operation.to_owned());
         waiting.finish(true);
         let g = &mut *g;
         if let Some(want) = &ctx.expect_udid {
@@ -713,29 +710,34 @@ impl Daemon {
         {
             return Response::error(error);
         }
-        // 改变界面的操作做完后缓存的元素树就作废；只有调用方声明「不改变布局」的按名字点击（max_age_ms > 0）保留
-        let keeps_cache = matches!(req, Request::TapElement { max_age_ms, .. } if max_age_ms > 0);
-        let invalidates = req.is_device_action() && !keeps_cache;
         if !matches!(req, Request::Observe { .. }) {
             g.settled_tree = None;
         }
+        let response = match req {
+            Request::Screenshot { region } => self.screenshot(g, region).await.unwrap_or_else(Response::error),
+            Request::Observe { limit, snapshot_timeout_ms } => {
+                self.observe(g, limit, Duration::from_millis(snapshot_timeout_ms)).await.unwrap_or_else(Response::error)
+            }
+            // 组合请求的 future 很大（操作 + 等稳定 + 看界面），放到堆上，免得撑爆栈
+            Request::Then { action, then } => Box::pin(self.run_then(g, action.map(|a| *a), then)).await,
+            req => {
+                let (r, outcome) = Box::pin(self.run_text(g, req)).await;
+                r.map(|t| Response::text_with(t, outcome)).unwrap_or_else(Response::error)
+            }
+        };
+        self.publish(g);
+        response
+    }
+
+    /// 执行一个回文字的请求（已持锁、已通过准入检查），连同结果里要据以行动的事实（[`crate::protocol::Outcome`]）
+    async fn run_text(&self, g: &mut Inner, req: Request) -> (Result<String, String>, crate::protocol::Outcome) {
+        // 改变界面的操作做完后缓存的元素树就作废；只有调用方声明「不改变布局」的按名字点击（max_age_ms > 0）保留
+        let keeps_cache = matches!(req, Request::TapElement { max_age_ms, .. } if max_age_ms > 0);
+        let invalidates = req.is_device_action() && !keeps_cache;
         // what the text reports, for clients that act on it (Response::Text.outcome)
         let mut outcome = crate::protocol::Outcome::default();
         let r = match req {
             Request::Status => Ok(self.status_text(g).await),
-            Request::Screenshot { region } => {
-                let resp = self.screenshot(g, region).await.unwrap_or_else(Response::error);
-                self.publish(g);
-                return resp;
-            }
-            Request::Observe { limit, snapshot_timeout_ms } => {
-                let response = self
-                    .observe(g, limit, Duration::from_millis(snapshot_timeout_ms))
-                    .await
-                    .unwrap_or_else(Response::error);
-                self.publish(g);
-                return response;
-            }
             Request::ListElements { filter, limit, max_age_ms, snapshot_timeout_ms } => {
                 self.list_elements(
                     g,
@@ -781,7 +783,13 @@ impl Daemon {
             }
             Request::ListDevices => Ok(self.list_devices_text(g)),
             Request::SelectDevice { device } => self.select_device(g, &device).await,
-            Request::Daemon | Request::Resign { .. } => unreachable!("上面已处理"),
+            Request::Daemon
+            | Request::Resign { .. }
+            | Request::Screenshot { .. }
+            | Request::Observe { .. }
+            | Request::Then { .. } => {
+                unreachable!("在 handle_request 里另外处理")
+            }
         };
         if invalidates {
             g.elements_cache = None;
@@ -790,8 +798,69 @@ impl Daemon {
                 g.unlocked_at = Some(Instant::now());
             }
         }
-        self.publish(g);
-        r.map(|t| Response::text_with(t, outcome)).unwrap_or_else(Response::error)
+        (r, outcome)
+    }
+
+    /// [`Request::Then`]：做完操作（出错就只回这个错误），再按 `then` 等界面稳定、附上界面，都在这一次持锁里。
+    /// 文字和 MCP 原来分几次调用拼出来的一样
+    async fn run_then(&self, g: &mut Inner, action: Option<Request>, then: ThenView) -> Response {
+        let (mut text, outcome) = match action {
+            Some(a) => match Box::pin(self.run_text(g, a)).await {
+                (Ok(t), o) => (t, o),
+                (Err(e), _) => return Response::error(e),
+            },
+            None => (String::new(), crate::protocol::Outcome::default()),
+        };
+        match then {
+            ThenView::None { alert_check } => {
+                // 结果里已经说了有弹窗（启动 App 被挡）就不再查
+                if alert_check
+                    && !outcome.alert_reported
+                    && let Ok(t) = self.alert_check(g).await
+                {
+                    text += &t;
+                }
+                Response::text_with(text, outcome)
+            }
+            ThenView::Elements { filter, limit, settle_ms, max_age_ms } => {
+                text += &self.then_settle(g, settle_ms).await;
+                g.settled_tree = None;
+                match self.list_elements(g, &filter, limit, Duration::from_millis(max_age_ms), Duration::ZERO).await {
+                    Ok(t) => {
+                        text +=
+                            &ictl_l10n::trf!("\n--- 操作后的界面 ---\n{t}", "\n--- Screen after the action ---\n{t}")
+                    }
+                    Err(m) => text += &ictl_l10n::trf!("\n(读界面失败:{m})", "\n(reading the screen failed: {m})"),
+                }
+                Response::text_with(text, outcome)
+            }
+            ThenView::Screenshot { region, settle_ms } => {
+                text += &self.then_settle(g, settle_ms).await;
+                g.settled_tree = None;
+                match self.screenshot(g, region).await {
+                    Ok(Response::Image { jpeg_base64, caption, coordinate_mapping }) => Response::TextAndImage {
+                        text,
+                        outcome: Some(outcome),
+                        jpeg_base64,
+                        caption,
+                        coordinate_mapping,
+                    },
+                    Ok(_) => Response::text_with(text, outcome),
+                    Err(m) => Response::text_with(
+                        text + &ictl_l10n::trf!("\n(截图失败:{m})", "\n(screenshot failed: {m})"),
+                        outcome,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// 组合请求里的「等界面稳定」：结果另起一行；失败不算整个请求失败
+    async fn then_settle(&self, g: &mut Inner, settle_ms: u64) -> String {
+        match self.settle(g, Duration::from_millis(settle_ms)).await {
+            Ok(t) => format!("\n{t}"),
+            Err(m) => ictl_l10n::trf!("\n(等界面稳定失败:{m})", "\n(waiting for the screen to settle failed: {m})"),
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -807,6 +876,24 @@ impl Daemon {
 
 /// 参数检查（与设备无关，不必拿锁）
 fn check_request(req: &Request) -> Result<(), String> {
+    if let Request::Then { action, then } = req {
+        if let Some(a) = action {
+            // 组合请求里只放一个操作类请求（不套组合请求、不放看界面的请求）
+            if !a.is_device_action() || matches!(**a, Request::Then { .. }) {
+                return Err(format!("then: {} is not an action", a.op()));
+            }
+            check_request(a)?;
+        }
+        return match then {
+            ThenView::Elements { limit, settle_ms, .. } if *limit > 1000 || *settle_ms > MAX_WAIT_MS => {
+                Err(format!("then: limit can't exceed 1000 and settle_ms can't exceed {MAX_WAIT_MS}"))
+            }
+            ThenView::Screenshot { settle_ms, .. } if *settle_ms > MAX_WAIT_MS => {
+                Err(format!("then: settle_ms can't exceed {MAX_WAIT_MS}"))
+            }
+            _ => Ok(()),
+        };
+    }
     match req {
         Request::Observe { limit, snapshot_timeout_ms } if *limit > 1000 || *snapshot_timeout_ms > 5000 => {
             return Err("Observation limit or snapshot budget exceeded".into());
@@ -972,6 +1059,49 @@ mod tests {
             .handle(Request::Tap { x: 1.0, y: 2.0 }, Instant::now() - Duration::from_secs(31), CallCtx::default())
             .await;
         assert!(matches!(old, Response::Error { message } if message.contains("已过期")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 组合请求：操作和顺带的检查在一次调用里做完；操作出错只回错误；参数不对一步都不做
+    #[tokio::test]
+    async fn then_runs_the_action_and_the_view_under_one_call() {
+        use crate::protocol::ThenView;
+        use ictl_wda::fake::Reply;
+        let (d, dir) = crate::testkit::daemon("then");
+        let fake = crate::testkit::healthy_wda();
+        crate::testkit::attach(&mut *d.inner.lock().await, &fake);
+        let tap = |x| Some(Box::new(Request::Tap { x, y: 2.0 }));
+        let r = d
+            .handle(
+                Request::Then { action: tap(1.0), then: ThenView::None { alert_check: true } },
+                Instant::now(),
+                CallCtx::default(),
+            )
+            .await;
+        assert!(matches!(&r, Response::Text { text, outcome: Some(_) } if text.starts_with("已点击 (1,2)")), "{r:?}");
+        assert_eq!(fake.count("POST", "/actions"), 1);
+        // 前台不是 SpringBoard：查弹窗只问了一次前台
+        assert!(fake.count("GET", "/wda/activeAppInfo") >= 1);
+
+        fake.on("POST", "/actions", Reply::timeout());
+        let r = d
+            .handle(
+                Request::Then { action: tap(3.0), then: ThenView::None { alert_check: true } },
+                Instant::now(),
+                CallCtx::default(),
+            )
+            .await;
+        assert!(matches!(&r, Response::Error { message } if message.contains("超时")), "{r:?}");
+
+        for bad in [
+            Request::Then { action: Some(Box::new(Request::Status)), then: ThenView::None { alert_check: false } },
+            Request::Then { action: tap(1.0), then: ThenView::Screenshot { region: None, settle_ms: MAX_WAIT_MS + 1 } },
+        ] {
+            let before = fake.requests().len();
+            let r = d.handle(bad, Instant::now(), CallCtx::default()).await;
+            assert!(matches!(r, Response::Error { .. }), "{r:?}");
+            assert_eq!(fake.requests().len(), before, "nothing is sent for a rejected request");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

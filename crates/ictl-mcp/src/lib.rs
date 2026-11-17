@@ -429,12 +429,6 @@ impl Args<'_> {
             .map(|v| number(v).ok_or_else(|| ictl_l10n::trf!("参数 {k} 要是数字", "parameter {k} must be a number")))
             .transpose()
     }
-    fn s(&self, k: &str) -> Result<String, String> {
-        self.get(k)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| ictl_l10n::trf!("缺少文字参数 {k}", "missing text parameter {k}"))
-    }
     fn s_or(&self, k: &str, d: &str) -> Result<String, String> {
         match self.get(k) {
             None => Ok(d.to_owned()),
@@ -442,14 +436,6 @@ impl Args<'_> {
                 .as_str()
                 .map(str::to_owned)
                 .ok_or_else(|| ictl_l10n::trf!("参数 {k} 要是文字", "parameter {k} must be text")),
-        }
-    }
-    fn u_or(&self, k: &str, d: usize) -> Result<usize, String> {
-        match self.get(k) {
-            None => Ok(d),
-            Some(v) => number(v).filter(|x| *x >= 0.0 && x.fract() == 0.0).map(|x| x as usize).ok_or_else(|| {
-                ictl_l10n::trf!("参数 {k} 要是非负整数", "parameter {k} must be a non-negative integer")
-            }),
         }
     }
     fn b_or(&self, k: &str, d: bool) -> Result<bool, String> {
@@ -463,59 +449,9 @@ impl Args<'_> {
     }
 }
 
-/// 工具调用 → 守护进程请求
+/// 工具调用 → 守护进程请求。参数检查和网关共用（[`protocol::tool_to_request`]），按 toolkit 兼容的口径读参数
 pub fn to_request(name: &str, args: &Map<String, Value>) -> Result<Request, String> {
-    let a = Args(args);
-    Ok(match name {
-        "iphone_status" => Request::Status,
-        "iphone_screenshot" => {
-            let r = [a.opt_f("x")?, a.opt_f("y")?, a.opt_f("width")?, a.opt_f("height")?];
-            let region = match r {
-                [None, None, None, None] => None,
-                [Some(x), Some(y), Some(w), Some(h)] => Some((x, y, w, h)),
-                _ => {
-                    return Err(ictl_l10n::tr!(
-                        "放大区域要同时给出 x、y、width、height",
-                        "a zoom region needs all of x, y, width and height"
-                    )
-                    .into());
-                }
-            };
-            Request::Screenshot { region }
-        }
-        "iphone_list_elements" => Request::ListElements {
-            filter: a.s_or("filter", "")?,
-            limit: a.u_or("limit", 150)?,
-            max_age_ms: 0,
-            snapshot_timeout_ms: 0,
-        },
-        "iphone_tap" => Request::Tap { x: a.f("x")?, y: a.f("y")? },
-        "iphone_tap_element" => Request::TapElement { text: a.s("text")?, index: a.u_or("index", 0)?, max_age_ms: 0 },
-        "iphone_long_press" => Request::LongPress { x: a.f("x")?, y: a.f("y")?, seconds: a.f_or("seconds", 1.0)? },
-        "iphone_swipe" => Request::Swipe {
-            from: (a.f("from_x")?, a.f("from_y")?),
-            to: (a.f("to_x")?, a.f("to_y")?),
-            seconds: a.f_or("seconds", 0.3)?,
-        },
-        "iphone_type_text" => Request::TypeText { text: a.s("text")?, submit: a.b_or("submit", false)? },
-        "iphone_press_button" => Request::PressButton { button: a.s("button")? },
-        "iphone_list_apps" => Request::ListApps { include_system: a.b_or("include_system", false)? },
-        "iphone_launch_app" => Request::LaunchApp { app: a.s("app")? },
-        "iphone_terminate_app" => Request::TerminateApp { app: a.s("app")? },
-        "iphone_open_url" => Request::OpenUrl { url: a.s("url")? },
-        "iphone_list_devices" => Request::ListDevices,
-        "iphone_select_device" => Request::SelectDevice { device: a.s("device")? },
-        "iphone_wait_for" => {
-            let secs = a.f_or("timeout", 5.0)?;
-            if !(0.0..=30.0).contains(&secs) {
-                return Err(
-                    ictl_l10n::tr!("timeout 要在 0 到 30 秒之间", "timeout must be between 0 and 30 seconds").into()
-                );
-            }
-            Request::WaitFor { text: a.s("text")?, timeout_ms: (secs * 1000.0) as u64 }
-        }
-        other => return Err(ictl_l10n::trf!("未知工具 {other}", "unknown tool {other}")),
-    })
+    protocol::tool_to_request(name, args, protocol::ArgPolicy::Compatible).map_err(|e| e.to_string())
 }
 
 /// 操作后顺带返回什么
@@ -648,12 +584,42 @@ pub fn wants_alert_check(req: &Request) -> bool {
 /// 守护进程响应 → MCP 结果。错误走工具错误（is_error），文字原样给客户端
 pub fn to_result(r: Response) -> CallToolResult {
     match r {
-        Response::Text { text, .. } => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Response::Image { jpeg_base64, caption, .. } => {
-            CallToolResult::success(vec![ContentBlock::image(jpeg_base64, "image/jpeg"), ContentBlock::text(caption)])
-        }
         Response::Error { message } => CallToolResult::error(vec![ContentBlock::text(message)]),
+        other => CallToolResult::success(blocks(other)),
     }
+}
+
+/// 成功响应的内容块（文字；截图加说明；组合结果是文字 + 截图 + 说明）
+fn blocks(r: Response) -> Vec<ContentBlock> {
+    match r {
+        Response::Text { text, .. } | Response::Error { message: text } => vec![ContentBlock::text(text)],
+        Response::Image { jpeg_base64, caption, .. } => {
+            vec![ContentBlock::image(jpeg_base64, "image/jpeg"), ContentBlock::text(caption)]
+        }
+        Response::TextAndImage { text, jpeg_base64, caption, .. } => {
+            vec![ContentBlock::text(text), ContentBlock::image(jpeg_base64, "image/jpeg"), ContentBlock::text(caption)]
+        }
+    }
+}
+
+/// then 的选项 → 组合请求里的 [`protocol::ThenView`]
+pub fn then_view(opts: &ThenOpts, alert_check: bool) -> protocol::ThenView {
+    match &opts.then {
+        Then::None => protocol::ThenView::None { alert_check },
+        Then::Elements(filter) => protocol::ThenView::Elements {
+            filter: filter.clone(),
+            limit: THEN_LIMIT,
+            settle_ms: opts.settle_ms,
+            // 等稳定时刚读过元素树，直接用它
+            max_age_ms: THEN_SETTLE_MS,
+        },
+        Then::Screenshot(region) => protocol::ThenView::Screenshot { region: *region, settle_ms: opts.settle_ms },
+    }
+}
+
+/// 旧版本守护进程不认识组合请求：它回「请求格式错误」，什么都没做，可以改成一步步调用
+fn then_unsupported(r: &Response) -> bool {
+    matches!(r, Response::Error { message } if message.contains("unknown variant `then`"))
 }
 
 #[derive(Debug, Clone)]
@@ -702,7 +668,16 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return Ok(to_result(Response::error(e)).into()),
         };
-        // then 只对操作类工具有意义；看界面的工具本身就是返回界面
+        // then 只对操作类工具有意义；看界面的工具本身就是返回界面。
+        // 操作和 then 合成一个请求，守护进程一次持锁做完；旧版本守护进程不认识就照原来一步步来
+        if req.is_device_action() {
+            let combined =
+                Request::Then { action: Some(Box::new(req.clone())), then: then_view(&then, wants_alert_check(&req)) };
+            let resp = self.call(&combined).await;
+            if !then_unsupported(&resp) {
+                return Ok(to_result(resp).into());
+            }
+        }
         let resp = self.call(&req).await;
         Ok(match resp {
             Response::Text { text, outcome } if req.is_device_action() => {
@@ -737,6 +712,25 @@ impl McpServer {
         let done = |blocks: Vec<ContentBlock>| {
             if failed { CallToolResult::error(blocks) } else { CallToolResult::success(blocks) }
         };
+        // 等稳定、看界面一次调用做完（守护进程一次持锁）；旧版本守护进程不认识就照原来一步步来
+        let resp = self.call(&Request::Then { action: None, then: then_view(&opts, alert_check) }).await;
+        if !then_unsupported(&resp) {
+            return match resp {
+                Response::Error { message } => done(vec![ContentBlock::text(ictl_l10n::trf!(
+                    "{text}
+(读界面失败:{message})",
+                    "{text}
+(reading the screen failed: {message})"
+                ))]),
+                Response::Text { text: t, .. } => done(vec![ContentBlock::text(text + &t)]),
+                Response::TextAndImage { text: t, jpeg_base64, caption, .. } => done(vec![
+                    ContentBlock::text(text + &t),
+                    ContentBlock::image(jpeg_base64, "image/jpeg"),
+                    ContentBlock::text(caption),
+                ]),
+                Response::Image { .. } => done(vec![ContentBlock::text(text)]),
+            };
+        }
         let then = opts.then;
         if then == Then::None {
             if alert_check && let Response::Text { text: t, .. } = self.call(&Request::AlertCheck).await {
@@ -752,7 +746,7 @@ impl McpServer {
                     "\n(waiting for the screen to settle failed: {message})"
                 )
             }
-            Response::Image { .. } => {}
+            Response::Image { .. } | Response::TextAndImage { .. } => {}
         }
         match then {
             Then::Elements(filter) => {
@@ -773,7 +767,7 @@ impl McpServer {
                     Response::Error { message } => {
                         text += &ictl_l10n::trf!("\n(读界面失败:{message})", "\n(reading the screen failed: {message})")
                     }
-                    Response::Image { .. } => {}
+                    Response::Image { .. } | Response::TextAndImage { .. } => {}
                 }
                 done(vec![ContentBlock::text(text)])
             }
@@ -788,6 +782,7 @@ impl McpServer {
                     "{text}\n(screenshot failed: {message})"
                 ))]),
                 Response::Text { text: t, .. } => done(vec![ContentBlock::text(format!("{text}\n{t}"))]),
+                Response::TextAndImage { .. } => done(vec![ContentBlock::text(text)]),
             },
             Then::None => unreachable!("上面已返回"),
         }
@@ -836,7 +831,9 @@ impl McpServer {
                         check = wants_alert_check(&req) && !protocol::alert_reported(&text, outcome);
                         lines.push(format!("{n}. {tool} → {text}"));
                     }
-                    Response::Image { caption, .. } => lines.push(format!("{n}. {tool} → {caption}")),
+                    Response::Image { caption, .. } | Response::TextAndImage { caption, .. } => {
+                        lines.push(format!("{n}. {tool} → {caption}"))
+                    }
                     Response::Error { message } => {
                         lines.push(ictl_l10n::trf!("{n}. {tool} → 出错:{message}", "{n}. {tool} → error: {message}"));
                         if n < total {
@@ -887,6 +884,34 @@ mod tests {
             }
         });
         with_lang(Lang::Zh, || assert!(has_cjk(instructions())));
+    }
+
+    /// 旧版本守护进程不认识组合请求时回的「请求格式错误」能认出来（什么都没做，可以改成一步步调用）
+    #[test]
+    fn older_daemons_rejecting_then_are_recognised() {
+        #[derive(Debug, rmcp::serde::Deserialize)]
+        #[serde(crate = "rmcp::serde", tag = "op", rename_all = "snake_case")]
+        enum OldRequest {
+            #[allow(dead_code)]
+            Status,
+        }
+        let wire = serde_json::to_string(&Request::Then {
+            action: Some(Box::new(Request::Tap { x: 1.0, y: 2.0 })),
+            then: then_view(&parse_then(&Map::new()).unwrap(), true),
+        })
+        .unwrap();
+        let e = serde_json::from_str::<OldRequest>(&wire).unwrap_err();
+        assert!(then_unsupported(&Response::error(format!("请求格式错误：{e}"))), "{e}");
+        assert!(!then_unsupported(&Response::error("WDA 请求超时")));
+        assert_eq!(
+            then_view(&parse_then(&args(json!({"then": "elements", "then_filter": "x"}))).unwrap(), false),
+            protocol::ThenView::Elements {
+                filter: "x".into(),
+                limit: THEN_LIMIT,
+                settle_ms: THEN_SETTLE_MS,
+                max_age_ms: THEN_SETTLE_MS
+            }
+        );
     }
 
     #[test]
