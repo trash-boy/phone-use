@@ -42,19 +42,17 @@ iPhone 预览优先使用 WDA 的独立 MJPEG 通道，在 AI 思考和操作期
 
 浏览器页面由 `crates/ictl-web/src/ui` 的 Leptos CSR 组件生成。会话、HTTP、轮询、手势、Android 命令和视频帧管理位于同一个 Rust crate。`web/main.mjs` 加载 WASM 并挂载页面，`web/android` 和 `web/client.mjs` 保留第三方 SDK 的构造和互操作桥。
 
-本地构建需要 Rust 1.90.0、`wasm32-unknown-unknown` 编译目标、与锁定依赖匹配的 wasm-bindgen CLI 0.2.130，以及 Node 22.13+。
+本地构建需要 rustup、与锁定依赖匹配的 wasm-bindgen CLI 0.2.130，以及 Node 22.13+。仓库根目录的 `rust-toolchain.toml` 固定 Rust 1.99.1（与 CI、Docker 构建镜像一致），并自动安装 `wasm32-unknown-unknown` 编译目标、clippy 和 rustfmt。
 
 ```bash
-rustup toolchain install 1.90.0
-rustup target add --toolchain 1.90.0 wasm32-unknown-unknown
-cargo +1.90.0 install wasm-bindgen-cli --version 0.2.130 --locked
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
 ```
 
-也可用 `WASM_BINDGEN_BIN` 指定已校验的 CLI 路径。`npm run build` 编译优化后的 release WASM，再生成 Vite 资产；`npm test` 编译调试 WASM 和根路径页面后运行测试。生成的 `pkg/`、`pkg-node/` 和 `dist/` 已加入 Git 忽略规则。`npm run typecheck` 检查 Rust/WASM 编译，`npm run test:browser` 用 Playwright 启动 Chrome/Chromium 验证页面。Mac 默认使用已安装的 Google Chrome，其他平台先执行 `npx playwright install chromium`，也可通过 `CHROME_BIN` 指定浏览器。
+也可用 `WASM_BINDGEN_BIN` 指定已校验的 CLI 路径，用 `WASM_CARGO_ARGS` 给 Cargo 追加参数（例如 `--config`）。`npm run build` 用 `wasm-release` 配置（`opt-level = "s"`、`panic = "abort"`、完整 LTO）编译 release WASM，去掉函数名调试段；装有 Binaryen 时再执行 `wasm-opt -Oz`（可用 `WASM_OPT_BIN` 指定路径，`WASM_OPT=0` 跳过；未安装只打印警告），然后生成 Vite 资产。2026-11-17 实测 release WASM 由 2,635,086 字节（gzip 818,398）降到 974,862 字节（gzip 297,517）；`wasm-opt -Oz` 再降到 841,204 字节，但 gzip 后约 316 KB，反而略大。`npm test` 编译调试 WASM 和根路径页面后运行测试。生成的 `pkg/`、`pkg-node/` 和 `dist/` 已加入 Git 忽略规则。`npm run typecheck` 检查 Rust/WASM 编译，`npm run test:browser` 用 Playwright 启动 Chrome/Chromium 验证页面。Mac 默认使用已安装的 Google Chrome，其他平台先执行 `npx playwright install chromium`，也可通过 `CHROME_BIN` 指定浏览器。
 
 ## 本地开发
 
-需要 Rust 1.90.0、Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。Node 用于 SDK 打包和浏览器测试，运行中的网关为 Rust 可执行文件。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release --locked -p iphone-control -p ictl-gateway`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
+需要 Rust（由 `rust-toolchain.toml` 选定）、Node 22.13+、Mac Chrome，以及服务器侧可执行的 `iphone-control`。Node 用于 SDK 打包和浏览器测试，运行中的网关为 Rust 可执行文件。当前源码基于 0.1.4，包含 Apple 登录连接复用和网页管道输入的兼容补丁。使用 Rust 1.88+ 在仓库根目录执行 `cargo build --release --locked -p iphone-control -p ictl-gateway`，将 `ICTL_BIN` 指向生成的 `target/release/iphone-control`。然后从仓库根目录执行：
 
 ```bash
 cd browser-control
@@ -80,7 +78,7 @@ python3.11 -m venv .venv
 
 打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)，在页面粘贴服务器访问令牌并点击「连接 iPhone」。令牌仅在本页内存中使用。首次连接需要解锁手机、信任电脑，并根据原生向导完成开发者模式、Apple 账号与 WDA 签名。
 
-前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api`、`/device` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 通过脚本启动 Rust 网关，默认由 Cargo 构建运行，也可在 shell 中设置 `GATEWAY_BIN` 指向预编译网关。Rust 启动时读取当前目录的 `.env`，shell 环境变量优先，原生子进程继承这些配置。安装多个工具链时可指定 `RUSTUP_TOOLCHAIN=1.90.0`。更改前端后，生产入口需要重新 `npm run build`。
+前端热更新可另开终端运行 `npm run web:dev`，访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 `/api`、`/device` 与 `/ios` 代理至 `127.0.0.1:8787`；页面服务器地址留空即可。`.env.example` 包含这两个开发 origin。`npm start` 和 `npm run dev` 通过脚本启动 Rust 网关，默认由 Cargo 构建运行，也可在 shell 中设置 `GATEWAY_BIN` 指向预编译网关。Rust 启动时读取当前目录的 `.env`，shell 环境变量优先，原生子进程继承这些配置。需要临时换用其他工具链时可设置 `RUSTUP_TOOLCHAIN`。更改前端后，生产入口需要重新 `npm run build`。
 
 ```bash
 cargo test --locked --manifest-path ../Cargo.toml -p ictl-gateway
@@ -90,7 +88,7 @@ npm run typecheck
 npm run build
 ```
 
-Rust 入口测试通过独立服务进程验证 HTTP/WebSocket/TCP/Unix Socket 和原生 CLI fixture。`npm run test:rust` 自动构建网关，也可使用 `RUST_GATEWAY_BIN` 指定已构建的绝对路径。迁移前的 Node 实现移至 `tests/reference`，供原测试作为兼容性参照。测试也包含发布版 SDK 的 `requestUSBAccess → pairDevice` 集成：一个明确标注的假 USB peer 回应 usbmux 版本握手，用假原生控制器与真实网关验证接口回退、恢复配对、关闭和删除会话。它没有模拟物理 iPhone、Apple 登录、Lockdown 授权或 WDA 控制成功。
+Rust 入口测试通过独立服务进程验证 HTTP/WebSocket/TCP/Unix Socket 和原生 CLI fixture。`npm run test:rust` 自动构建网关，也可使用 `RUST_GATEWAY_BIN` 指定已构建的绝对路径。迁移前的 Node 实现移至 `tests/reference`，供原测试作为兼容性参照。中继帧只在 Rust 网关和 WASM 客户端中实现；`tests/support/relay-protocol.mjs` 是仅供测试使用的独立 Node 编码器。测试也包含发布版 SDK 的 `requestUSBAccess → pairDevice` 集成：一个明确标注的假 USB peer 回应 usbmux 版本握手，用假原生控制器与真实网关验证接口回退、恢复配对、关闭和删除会话。它没有模拟物理 iPhone、Apple 登录、Lockdown 授权或 WDA 控制成功。
 
 ## 页面行为（iPhone 流程）
 
@@ -106,7 +104,7 @@ AI 任务执行期间暂停手动操作。确认框显示具体操作、参数�
 
 ### 画面与识别性能
 
-网页通过 `/api/sessions/:id/preview` 获取纯图片，预览不会读取元素树。AI 运行期间该接口直接返回任务最近采集的真实画面；首张观察尚未完成时返回 `null`，页面保留现有画面。任务状态每秒独立刷新，不再等待截图完成。设备空闲时短时间内的并发预览合并，设备命令执行后会使预览缓存失效。
+网页通过 `/api/sessions/:id/preview` 获取纯图片，预览不会读取元素树。AI 运行期间该接口直接返回任务最近采集的真实画面；首张观察尚未完成时返回 `null`，页面保留现有画面。图片本身从 `/api/sessions/:id/screen.jpg` 以 Blob 读取并显示为 object URL（旧 URL 随即释放），base64 不再复制进 WASM；网关没有该路由时退回 JSON 里的 base64。任务状态每秒独立刷新，不再等待截图完成；请求失败时按 1、2、4…最长 30 秒退避，成功后恢复；标签页隐藏时暂停轮询，重新可见时立即刷新。设备空闲时短时间内的并发预览合并，设备命令执行后会使预览缓存失效。
 
 AI 任务通过原生 `observe` 请求采图。`AI_OBSERVATION` 决定模型看到什么：
 
@@ -173,7 +171,7 @@ phone.example.com {
 
 `signing-state` 卷保留原生账号和签名材料，应按敏感数据管理访问和备份；运行目录与索引使用 owner-only 权限。关闭会话会终止其拥有的原生进程组并释放临时 socket，保留签名恢复资料。一个运行目录由一个网关进程独占；多实例共享卷前需要额外分布式租约。删除卷会丢失恢复资料，轮换控制令牌也会改变恢复索引键。
 
-Dockerfile 默认使用一个 Cargo 构建任务，适配小内存 VPS，可通过 `--build-arg CARGO_BUILD_JOBS=2` 调整。许可证生成复用 cargo-about 0.9.3 官方 Linux 发布包，下载后校验官方 SHA256。`--build-arg WEB_BASE=/iphone/` 可指定静态资源前缀，默认 `/`。子路径部署时，代理需去除网页路径前缀，并将同 origin 的 `/api/`、`/device/` 与 `/ios/` 转发给网关，`PUBLIC_BASE_URL` 仍填写 origin。
+Dockerfile 默认使用两个 Cargo 构建任务，兼顾小内存 VPS，可通过 `--build-arg CARGO_BUILD_JOBS=1` 等调整；CI 传入 `$(nproc)`。基础镜像按 digest 固定，升级时同时更新 Dockerfile 顶部的标签和 digest。WASM 阶段使用独立的 Cargo 缓存和 `CARGO_TARGET_DIR`，不会复用原生构建的产物。许可证生成复用 cargo-about 0.9.3 官方 Linux 发布包，下载后校验官方 SHA256。`--build-arg WEB_BASE=/iphone/` 可指定静态资源前缀，默认 `/`。子路径部署时，代理需去除网页路径前缀，并将同 origin 的 `/api/`、`/device/` 与 `/ios/` 转发给网关，`PUBLIC_BASE_URL` 仍填写 origin。
 
 2026-11-09 已在 Linux VPS 实际构建并运行容器，入口为 [云端工作台](https://amazingly.top/iphone/)。公网 HTTPS、静态资源、REST 鉴权、WebSocket 来源校验和升级均已验证。模型通过 VPS 上的 Magpie 网关接入 `codex/gpt-6.1-sol`，独立视觉 API 测试成功。用户选择本次先完成部署，VPS 与真实手机的联调尚未执行。详细范围见 [验证记录](VERIFICATION.md)。原生依赖的说明和许可证见 [THIRD_PARTY.md](THIRD_PARTY.md) 与仓库原有 [第三方声明](../THIRD_PARTY.md)。
 
