@@ -230,10 +230,19 @@ async fn bridge_replies_are_validated_before_becoming_device_actions() {
         (json!("{\"type\":\"done\",\"message\":\"OK\"}"), "expected a JSON object"),
     ] {
         let bridge = Bridge::new();
-        let (result, _) = tokio::join!(
+        // An invalid reply gets one correction attempt, like the OpenAI path.
+        let replies = async {
+            let first = bridge.respond(json!({"reply":reply})).await;
+            let second = bridge.respond(json!({"reply":reply})).await;
+            (first, second)
+        };
+        let (result, (_, (_, correction))) = tokio::join!(
             bounded(bridge.model.generate("Inspect", json!({"queryOnly":true}), vec![], &[], CancellationToken::new())),
-            bounded(bridge.respond(json!({"reply":reply})))
+            bounded(replies)
         );
+        let last = correction["content"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap().to_owned();
+        assert!(last.starts_with("Your previous reply failed validation"), "{last}");
+        assert!(correction.get("followUp").is_none(), "no follow-up without a bridge thread history");
         let error = result.unwrap_err();
         assert_eq!(error.status, 503, "{reply}");
         assert!(error.message.starts_with("Invalid model reply:"), "{}", error.message);
@@ -264,4 +273,82 @@ async fn cancelling_an_inflight_plan_closes_the_unix_socket() {
     assert_eq!(error.status, 503);
     assert_eq!(error.message, "Model request cancelled");
     assert!(bridge.model.ready());
+}
+
+#[tokio::test]
+async fn follow_ups_deadlines_and_corrections_reach_the_bridge() {
+    let bridge = Bridge::new();
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 3).write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+    let screenshot = base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner());
+    let observation = Observation::from_value(
+        json!({"observationId":"step-2","caption":"2x3","elementsText":"Button: OK","imageBase64":screenshot}),
+    );
+    let follow_up = FollowUp {
+        instruction: None,
+        steps: vec![json!({"tool":"iphone_tap","state":"succeeded","result":{"kind":"text","text":"Tapped"}})],
+    };
+    let request = PlanRequest {
+        instruction: "Play",
+        observation: &observation,
+        history: vec![json!({"tool":"iphone_tap","old":true})],
+        follow_up: Some(follow_up),
+        images: &[],
+        session: Some("session-1"),
+    };
+    let valid = json!({"type":"done","message":"won"});
+    let replies = async {
+        let first = bridge.respond(json!({"reply":{"type":"action","tool":"unknown"}})).await;
+        let second = bridge.respond(json!({"reply":valid})).await;
+        (first.1, second.1)
+    };
+    let (result, (first, second)) =
+        tokio::join!(bounded(bridge.model.plan(request, CancellationToken::new())), bounded(replies));
+    assert_eq!(result.unwrap(), valid);
+    assert_eq!(first["session"], "session-1");
+    let deadline = first["deadlineMs"].as_u64().unwrap();
+    assert!(deadline > 90_000 && deadline <= 95_000, "{deadline}");
+    assert!(second["deadlineMs"].as_u64().unwrap() <= deadline);
+    // Full content for a fresh thread still carries the whole history.
+    let context: Value = serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(context["recentHistory"][0]["old"], true);
+    // The follow-up is the delta: new observation, screenshot and the step since the last plan.
+    let follow_up = first["followUp"].as_array().unwrap();
+    assert_eq!(follow_up.len(), 2);
+    let delta: Value = serde_json::from_str(follow_up[0]["text"].as_str().unwrap()).unwrap();
+    assert!(delta.get("recentHistory").is_none() && delta.get("instruction").is_none());
+    assert_eq!(delta["stepsSinceLastPlan"][0]["result"]["text"], "Tapped");
+    assert_eq!(delta["observation"]["observationId"], "step-2");
+    assert_eq!(delta["observation"]["elementsText"], "Button: OK");
+    assert_eq!(follow_up[1]["type"], "image_url");
+    // The correction follow-up only adds the rejected reply and the correction.
+    let correction = second["followUp"].as_array().unwrap();
+    assert_eq!(correction.len(), 2);
+    assert!(correction[0]["text"].as_str().unwrap().starts_with("Your previous reply was:"));
+    assert!(correction[1]["text"].as_str().unwrap().starts_with("Your previous reply failed validation"));
+    assert_eq!(second["content"].as_array().unwrap().len(), first["content"].as_array().unwrap().len() + 2);
+}
+
+#[tokio::test]
+async fn closing_a_session_tells_the_bridge_and_ignores_its_answer() {
+    let bridge = Bridge::new();
+    bridge.model.close_session("session-1");
+    let (mut stream, _) = bounded(bridge.listener.accept()).await.unwrap();
+    let (headers, body) = bounded(read_request(&mut stream)).await;
+    assert!(headers.starts_with("POST /session/close HTTP/1.1\r\n"));
+    assert_eq!(body, json!({"session":"session-1"}));
+    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+}
+
+#[tokio::test]
+async fn configuration_probes_are_cached_for_concurrent_and_repeated_callers() {
+    let bridge = Bridge::new();
+    let (first, second, (headers, _)) = tokio::join!(
+        bounded(bridge.model.configuration()),
+        bounded(bridge.model.configuration()),
+        bounded(bridge.respond(json!({"ok":true})))
+    );
+    assert!(headers.starts_with("GET /health"));
+    assert_eq!(first, second);
+    assert_eq!(bounded(bridge.model.configuration()).await["aiReady"], true, "no second probe within the TTL");
 }

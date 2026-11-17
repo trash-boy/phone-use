@@ -65,7 +65,12 @@ pub struct Model {
     reasoning_refused: Arc<Mutex<HashSet<String>>>,
     ocr: Arc<crate::ocr::Ocr>,
     observation_mode: ObservationMode,
+    /// `/api/config` answer, shared by concurrent callers (single flight) for `CONFIG_TTL`.
+    config: Arc<Mutex<Option<(Instant, Value)>>>,
 }
+/// `/api/config` is public (the page reads it before connecting), so a burst of
+/// requests reuses one bridge health probe or provider catalog fetch.
+const CONFIG_TTL: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct Catalog {
     fetched: Option<Instant>,
@@ -134,7 +139,8 @@ impl Model {
                     cc_models.push(name.to_owned());
                 }
             }
-            let name = env.get("CODEX_MODEL").map(|name| name.trim().to_owned()).unwrap_or_else(|| cc_models[0].clone());
+            let name =
+                env.get("CODEX_MODEL").map(|name| name.trim().to_owned()).unwrap_or_else(|| cc_models[0].clone());
             anyhow::ensure!(valid_model_id(&name) && cc_models.contains(&name), "CODEX_MODEL must be in CODEX_MODELS");
             (name, String::new(), String::new())
         } else if cc {
@@ -188,12 +194,15 @@ impl Model {
             reasoning_effort: match get("AI_REASONING_EFFORT").to_ascii_lowercase().as_str() {
                 "" => Some("low".to_owned()),
                 "off" | "none" => None,
-                effort if effort.len() <= 16 && effort.bytes().all(|b| b.is_ascii_lowercase()) => Some(effort.to_owned()),
+                effort if effort.len() <= 16 && effort.bytes().all(|b| b.is_ascii_lowercase()) => {
+                    Some(effort.to_owned())
+                }
                 _ => anyhow::bail!("AI_REASONING_EFFORT must be a lowercase effort name or off"),
             },
             reasoning_refused: Arc::default(),
             ocr: Arc::new(crate::ocr::Ocr::new(env)),
             observation_mode: ObservationMode::parse(&get("AI_OBSERVATION"))?,
+            config: Arc::default(),
         })
     }
     pub fn observation_mode(&self) -> ObservationMode {
@@ -268,6 +277,18 @@ impl Model {
         (names, catalog.failed)
     }
     pub async fn configuration(&self) -> Value {
+        // Holding the lock while probing makes concurrent callers wait for one probe.
+        let mut cached = self.config.lock().await;
+        if let Some((at, config)) = cached.as_ref()
+            && at.elapsed() < CONFIG_TTL
+        {
+            return config.clone();
+        }
+        let config = self.probe_configuration().await;
+        *cached = Some((Instant::now(), config.clone()));
+        config
+    }
+    async fn probe_configuration(&self) -> Value {
         if self.cc {
             let health = async {
                 let response = self
@@ -284,7 +305,11 @@ impl Model {
             let ready = matches!(tokio::time::timeout(Duration::from_secs(2), health).await, Ok(Ok(true)));
             let mut config = json!({"backend":self.bridge,"aiReady":ready,"model":self.name,"models":self.cc_models});
             if !ready {
-                config["aiError"] = json!(if self.bridge == "codex" { "Codex bridge is unavailable" } else { "CC bridge is unavailable" });
+                config["aiError"] = json!(if self.bridge == "codex" {
+                    "Codex bridge is unavailable"
+                } else {
+                    "CC bridge is unavailable"
+                });
             }
             return config;
         }
@@ -316,6 +341,8 @@ impl Model {
         selected.name = Some(name.to_owned());
         Ok(selected)
     }
+    /// Convenience entry point that plans from an undecoded observation with no
+    /// bridge follow-up (tests and simple callers).
     pub async fn generate(
         &self,
         instruction: &str,
@@ -324,176 +351,222 @@ impl Model {
         images: &[crate::attachments::ReferenceImage],
         cancel: CancellationToken,
     ) -> Result<Value> {
-        let operation = self.generate_inner(instruction, observation, history, images, cancel.clone());
-        if !self.cc {
-            return operation.await;
+        let observation = Observation::from_value(observation);
+        let request =
+            PlanRequest { instruction, observation: &observation, history, follow_up: None, images, session: None };
+        self.plan(request, cancel).await
+    }
+
+    /// OCR evidence for an observation in hybrid and OCR modes, `None` in image
+    /// mode or without a phone image. Runs before planning on its own OCR
+    /// deadline, so a cold OCR start never consumes the model's time budget.
+    pub async fn recognize(&self, observation: &Observation, cancel: CancellationToken) -> Option<Result<Value>> {
+        if self.observation_mode == ObservationMode::Image {
+            return None;
         }
-        // Dropping the operation closes the in-flight Unix HTTP request. The
-        // bridge observes the disconnect and terminates its planner subprocess.
+        let image = observation.value["imageBase64"].as_str()?;
+        Some(self.ocr.recognize(image, observation.jpeg.as_deref(), Some(&observation.value), cancel).await)
+    }
+
+    /// Time one planning call may take once its evidence is ready, including the
+    /// single correction retry. The bridge receives what is left as `deadlineMs`.
+    fn model_budget(&self) -> Duration {
+        if self.cc { CC_MODEL_BUDGET } else { OPENAI_MODEL_BUDGET }
+    }
+
+    pub async fn plan(&self, request: PlanRequest<'_>, cancel: CancellationToken) -> Result<Value> {
+        let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
+        let observation = request.observation;
+        let observation_id = observation.value["observationId"].as_str().unwrap_or("").to_owned();
+        // Evidence first (OCR has its own deadline); the model budget starts afterwards.
+        let evidence = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ApiError::unavailable("Model request cancelled")),
+            evidence = self.evidence(observation, &observation_id, request.images, cancel.clone()) => evidence?,
+        };
+        let deadline = Instant::now() + self.model_budget();
+        let content = evidence.content(request.instruction, &request.history);
+        let operation = async {
+            if self.cc {
+                let follow_up = request.follow_up.as_ref().map(|follow_up| evidence.follow_up(follow_up));
+                self.bridge_plan(endpoint, content, follow_up, request.session, deadline, &observation_id).await
+            } else {
+                self.openai_plan(&endpoint, content, &observation_id).await
+            }
+        };
+        // Dropping the operation closes an in-flight bridge request; the bridge
+        // observes the disconnect and terminates its planner.
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ApiError::unavailable("Model request cancelled")),
-            result = tokio::time::timeout(Duration::from_secs(95), operation) => {
+            result = tokio::time::timeout_at(deadline.into(), operation) => {
                 result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
             }
         }
     }
-    async fn generate_inner(
-        &self,
-        instruction: &str,
-        observation: Value,
-        history: Vec<Value>,
-        images: &[crate::attachments::ReferenceImage],
-        cancel: CancellationToken,
-    ) -> Result<Value> {
-        let endpoint = self.endpoint.clone().ok_or_else(|| ApiError::unavailable("AI is not configured"))?;
-        let observation_id = observation["observationId"].as_str().unwrap_or("");
-        let content = match self.observation_mode {
-            ObservationMode::Ocr => {
-                self.ocr_content(instruction, &observation, observation_id, history, images, cancel.clone()).await?
-            }
-            mode => {
-                self.image_content(mode, instruction, &observation, observation_id, history, images, cancel.clone())
-                    .await?
-            }
-        };
+
+    async fn openai_plan(&self, endpoint: &reqwest::Url, content: Vec<Value>, observation_id: &str) -> Result<Value> {
         let system_prompt = self.observation_mode.system_prompt();
-        if self.cc {
-            let schema: Value = serde_json::from_str(include_str!("model-reply.schema.json"))
-                .map_err(|_| ApiError::unavailable("Invalid model reply schema"))?;
-            let system = format!("{system_prompt}\nRespond only with a JSON object matching this schema: {schema}");
-            let response = self
-                .client
-                .post(endpoint)
-                // The Codex bridge keeps one agent thread per session, so the agent's own memory spans steps and tasks.
-                .json(&json!({"model":self.name,"system":system,"content":content,"session":observation["bridgeSession"]}))
-                .send()
-                .await
-                .map_err(|_| ApiError::unavailable("CC bridge request failed"))?;
-            let bytes = bounded_cc_body(response, 1024 * 1024).await?;
-            let envelope: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| ApiError::unavailable("CC bridge returned an invalid JSON envelope"))?;
-            return validate_reply(
+        let messages = Mutex::new(vec![
+            json!({"role":"system","content":system_prompt}),
+            json!({"role":"user","content":content}),
+        ]);
+        with_correction(observation_id, |correction| {
+            let messages = &messages;
+            async move {
+                let mut messages = messages.lock().await;
+                let (max_tokens, attempt) = match correction {
+                    Some(correction) => {
+                        if let Some(text) = correction.previous {
+                            messages.push(json!({"role":"assistant","content":text}));
+                        }
+                        messages.push(json!({"role":"user","content":correction.message}));
+                        (2048, 2)
+                    }
+                    None => (1024, 1),
+                };
+                self.completion(endpoint, &messages, max_tokens, attempt, observation_id).await.map(RawReply::Choice)
+            }
+        })
+        .await
+    }
+
+    async fn bridge_plan(
+        &self,
+        endpoint: reqwest::Url,
+        content: Vec<Value>,
+        follow_up: Option<Vec<Value>>,
+        session: Option<&str>,
+        deadline: Instant,
+        observation_id: &str,
+    ) -> Result<Value> {
+        let schema: Value = serde_json::from_str(include_str!("model-reply.schema.json"))
+            .map_err(|_| ApiError::unavailable("Invalid model reply schema"))?;
+        let system = format!(
+            "{}\nRespond only with a JSON object matching this schema: {schema}",
+            self.observation_mode.system_prompt()
+        );
+        with_correction(observation_id, |correction| {
+            let (endpoint, system) = (endpoint.clone(), &system);
+            let (mut content, mut follow_up) = (content.clone(), follow_up.clone());
+            async move {
+                if let Some(correction) = correction {
+                    // A fresh thread needs the whole step plus the rejected reply; an
+                    // existing thread already holds both and only needs the correction.
+                    let mut blocks = Vec::new();
+                    if let Some(previous) = &correction.previous {
+                        blocks.push(json!({"type":"text","text":format!("Your previous reply was:\n{previous}")}));
+                    }
+                    blocks.push(json!({"type":"text","text":correction.message}));
+                    content.extend(blocks.iter().cloned());
+                    follow_up = follow_up.map(|_| blocks);
+                }
+                let mut body = json!({"model":self.name,"system":system,"content":content,"session":session,
+                    "deadlineMs":deadline.saturating_duration_since(Instant::now()).as_millis() as u64});
+                if let Some(follow_up) = follow_up {
+                    body["followUp"] = json!(follow_up);
+                }
+                let response = self
+                    .client
+                    .post(endpoint)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|_| ApiError::unavailable("CC bridge request failed"))?;
+                let bytes = bounded_cc_body(response, 1024 * 1024).await?;
+                let envelope: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| ApiError::unavailable("CC bridge returned an invalid JSON envelope"))?;
                 envelope
                     .get("reply")
                     .cloned()
-                    .ok_or_else(|| ApiError::unavailable("CC bridge response is missing reply"))?,
-            );
-        }
-        let operation = async {
-            let mut messages =
-                vec![json!({"role":"system","content":system_prompt}), json!({"role":"user","content":content})];
-            let choice = self.completion(&endpoint, &messages, 1024, 1, observation_id).await?;
-            match decode_logged_reply(&choice, 1, observation_id) {
-                Ok(action) => Ok(action),
-                Err(error) => {
-                    // No device action has been dispatched. Re-plan once from the same
-                    // observation, retaining the original task and confirmation rules.
-                    if let Ok(text) = reply_text(&choice) {
-                        messages.push(json!({"role":"assistant","content":truncate(&text, 8192)}));
-                    }
-                    messages.push(json!({"role":"user","content":correction_message(&error.message)}));
-                    let choice = self.completion(&endpoint, &messages, 2048, 2, observation_id).await?;
-                    decode_logged_reply(&choice, 2, observation_id)
-                }
+                    .map(RawReply::Bridge)
+                    .ok_or_else(|| ApiError::unavailable("CC bridge response is missing reply"))
             }
+        })
+        .await
+    }
+
+    /// Tells the bridge a gateway session ended so it can drop that session's
+    /// agent thread. Best effort: detached, short timeout, errors and 404 ignored.
+    pub fn close_session(&self, session: &str) {
+        if !self.cc {
+            return;
+        }
+        let (client, body) = (self.client.clone(), json!({"session":session}));
+        tokio::spawn(async move {
+            let request = client.post("http://localhost/session/close").json(&body).send();
+            let _ = tokio::time::timeout(Duration::from_secs(2), request).await;
+        });
+    }
+
+    /// The observation evidence shared by full content and bridge follow-ups.
+    async fn evidence(
+        &self,
+        observation: &Observation,
+        observation_id: &str,
+        images: &[crate::attachments::ReferenceImage],
+        cancel: CancellationToken,
+    ) -> Result<Evidence> {
+        let value = &observation.value;
+        let mut evidence = json!({
+            "observationId":observation_id,
+            "caption":truncate(value["caption"].as_str().unwrap_or(""),1000),
+        });
+        if self.observation_mode != ObservationMode::Ocr {
+            evidence["elementsText"] = json!(truncate(value["elementsText"].as_str().unwrap_or(""), 16384));
+        }
+        evidence["queryOnly"] = json!(value["queryOnly"] == true);
+        let image = value["imageBase64"].as_str();
+        let ocr = match &observation.ocr {
+            Some(ocr) => Some(ocr.clone()),
+            None => self.recognize(observation, cancel.clone()).await,
         };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(ApiError::unavailable("Model request cancelled")),
-            result = tokio::time::timeout(Duration::from_secs(60), operation) => {
-                result.unwrap_or_else(|_| Err(ApiError::unavailable("Model request timed out")))
+        if self.observation_mode == ObservationMode::Ocr {
+            match ocr {
+                Some(ocr) => evidence["ocr"] = ocr?,
+                None if value["queryOnly"] != true => return Err(ApiError::unavailable("OCR phone image unavailable")),
+                None => {}
             }
-        }
-    }
-
-    /// Image and hybrid payloads: caption, UI element text, screenshot and
-    /// reference images with their phone URLs. Hybrid adds OCR evidence when
-    /// the worker succeeds; any other OCR failure keeps the image-only step.
-    #[allow(clippy::too_many_arguments)]
-    async fn image_content(
-        &self,
-        mode: ObservationMode,
-        instruction: &str,
-        observation: &Value,
-        observation_id: &str,
-        history: Vec<Value>,
-        images: &[crate::attachments::ReferenceImage],
-        cancel: CancellationToken,
-    ) -> Result<Vec<Value>> {
-        let mut evidence = json!({
-            "observationId":observation_id,
-            "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),
-            "elementsText":truncate(observation["elementsText"].as_str().unwrap_or(""),16384),
-            "queryOnly":observation["queryOnly"] == true,
-            "elementsError":observation.get("elementsError").map(|_|"UI elements unavailable"),
-        });
-        let image = observation["imageBase64"].as_str();
-        if mode == ObservationMode::Hybrid
-            && let Some(image) = image
-        {
-            match self.ocr.recognize(image, Some(observation), cancel.clone()).await {
-                Ok(ocr) => evidence["ocr"] = ocr,
-                Err(_) if cancel.is_cancelled() => return Err(ApiError::unavailable("Model request cancelled")),
-                Err(error) => {
-                    eprintln!(
-                        "event=ocr_degraded metrics={}",
-                        json!({"observation_id":observation_id,"reason":error.message})
-                    );
-                    evidence["ocrError"] = json!("OCR unavailable");
-                }
+            let mut references = Vec::new();
+            for (index, image) in images.iter().enumerate() {
+                let data = image.content["image_url"]["url"]
+                    .as_str()
+                    .and_then(|url| {
+                        url.strip_prefix("data:image/png;base64,")
+                            .or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
+                    })
+                    .ok_or_else(|| ApiError::unavailable("OCR reference image invalid"))?;
+                references.push(
+                    json!({"index":index+1,"name":image.name,"ocr":self.ocr.recognize_reference(data, cancel.clone()).await?}),
+                );
             }
+            return Ok(Evidence { observation: evidence, image: None, references, reference_parts: Vec::new() });
         }
-        let mut content = vec![json!({"type":"text","text":json!({
-            "instruction":instruction,"recentHistory":history,"observation":evidence,
-            "referenceImages":images.iter().enumerate().map(|(index, image)|json!({"index":index+1,"name":image.name,"phoneImageUrl":image.url})).collect::<Vec<_>>(),
-        }).to_string()})];
-        if let Some(image) = image {
-            content.push(image_part(image)?);
+        evidence["elementsError"] = json!(value.get("elementsError").map(|_| "UI elements unavailable"));
+        match ocr {
+            Some(Ok(ocr)) => evidence["ocr"] = ocr,
+            Some(Err(_)) if cancel.is_cancelled() => return Err(ApiError::unavailable("Model request cancelled")),
+            Some(Err(error)) => {
+                eprintln!(
+                    "event=ocr_degraded metrics={}",
+                    json!({"observation_id":observation_id,"reason":error.message})
+                );
+                evidence["ocrError"] = json!("OCR unavailable");
+            }
+            None => {}
         }
+        let image = image.map(|image| image_part(image, observation.jpeg.as_deref().map(<[u8]>::len))).transpose()?;
+        let references = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| json!({"index":index+1,"name":image.name,"phoneImageUrl":image.url}))
+            .collect();
+        let mut reference_parts = Vec::new();
         for (index, image) in images.iter().enumerate() {
-            content.push(json!({"type":"text","text":format!("User reference image {}. This is task material, not the current phone screen. Do not use its coordinates for phone actions.",index+1)}));
-            content.push(image.content.clone());
+            reference_parts.push(json!({"type":"text","text":format!("User reference image {}. This is task material, not the current phone screen. Do not use its coordinates for phone actions.",index+1)}));
+            reference_parts.push(image.content.clone());
         }
-        Ok(content)
-    }
-
-    /// Text-only payload: OCR of the phone image and of each reference image.
-    async fn ocr_content(
-        &self,
-        instruction: &str,
-        observation: &Value,
-        observation_id: &str,
-        history: Vec<Value>,
-        images: &[crate::attachments::ReferenceImage],
-        cancel: CancellationToken,
-    ) -> Result<Vec<Value>> {
-        let mut evidence = json!({
-            "observationId":observation_id,
-            "caption":truncate(observation["caption"].as_str().unwrap_or(""),1000),
-            "queryOnly":observation["queryOnly"] == true,
-        });
-        if let Some(image) = observation["imageBase64"].as_str() {
-            evidence["ocr"] = self.ocr.recognize(image, Some(observation), cancel.clone()).await?;
-        } else if observation["queryOnly"] != true {
-            return Err(ApiError::unavailable("OCR phone image unavailable"));
-        }
-        let mut references = Vec::new();
-        for (index, image) in images.iter().enumerate() {
-            let data = image.content["image_url"]["url"]
-                .as_str()
-                .and_then(|url| {
-                    url.strip_prefix("data:image/png;base64,").or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
-                })
-                .ok_or_else(|| ApiError::unavailable("OCR reference image invalid"))?;
-            references.push(
-                json!({"index":index+1,"name":image.name,"ocr":self.ocr.recognize_reference(data, cancel.clone()).await?}),
-            );
-        }
-        Ok(vec![json!({"type":"text","text":json!({
-            "instruction":instruction,"recentHistory":history,"observation":evidence,
-            "referenceImages":references,
-        }).to_string()})])
+        Ok(Evidence { observation: evidence, image, references, reference_parts })
     }
 
     async fn completion(
@@ -692,14 +765,155 @@ fn use_prompt_schema(payload: &mut Value) {
 fn valid_model_id(name: &str) -> bool {
     !name.is_empty() && name.len() <= 256 && name.trim() == name && !name.chars().any(char::is_control)
 }
-fn image_part(image: &str) -> Result<Value> {
-    if image.len() > 8 * 1024 * 1024
-        || base64::engine::general_purpose::STANDARD.decode(image).map_or(true, |b| b.len() > 6 * 1024 * 1024)
-    {
+/// Base64 text of `image` decodes to this many bytes (without decoding it).
+fn decoded_len(image: &str) -> usize {
+    let padding = image.bytes().rev().take(2).filter(|b| *b == b'=').count();
+    (image.len() / 4 * 3 + [0, 0, 1, 2][image.len() % 4]).saturating_sub(padding)
+}
+/// `decoded` is the size of the already decoded frame; without it (the frame did
+/// not decode) the image is rejected rather than sent as an unreadable payload.
+fn image_part(image: &str, decoded: Option<usize>) -> Result<Value> {
+    let decoded = decoded.unwrap_or_else(|| {
+        if base64::engine::general_purpose::STANDARD.decode(image).is_ok() { decoded_len(image) } else { usize::MAX }
+    });
+    if image.len() > 8 * 1024 * 1024 || decoded > 6 * 1024 * 1024 {
         return Err(ApiError::unavailable("Phone image exceeds model limit"));
     }
     Ok(json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}))
 }
+
+/// Model-backend reply before decoding: an OpenAI-compatible choice, or the
+/// `reply` value of a host bridge.
+enum RawReply {
+    Choice(Value),
+    Bridge(Value),
+}
+/// What a correction attempt tells the model about its rejected first reply.
+struct Correction {
+    previous: Option<String>,
+    message: String,
+}
+impl RawReply {
+    fn decode(&self, attempt: u8, observation_id: &str) -> Result<Value> {
+        match self {
+            Self::Choice(choice) => decode_logged_reply(choice, attempt, observation_id),
+            Self::Bridge(reply) => {
+                let result = validate_reply(reply.clone());
+                eprintln!(
+                    "event=model_protocol metrics={}",
+                    json!({"observation_id":observation_id,"attempt":attempt,"backend":"bridge",
+                        "decode_category":protocol_decode_category(&result)})
+                );
+                result
+            }
+        }
+    }
+    fn text(&self) -> Option<String> {
+        let text = match self {
+            Self::Choice(choice) => reply_text(choice).ok()?,
+            Self::Bridge(Value::String(text)) => text.clone(),
+            Self::Bridge(reply) => reply.to_string(),
+        };
+        Some(truncate(&text, 8192))
+    }
+}
+/// Backend-agnostic decoding: an invalid first reply gets exactly one correction
+/// attempt from the same observation. No device action has been dispatched yet,
+/// so re-planning is safe; the original task and confirmation rules still apply.
+async fn with_correction<F, Fut>(observation_id: &str, mut call: F) -> Result<Value>
+where
+    F: FnMut(Option<Correction>) -> Fut,
+    Fut: std::future::Future<Output = Result<RawReply>>,
+{
+    let first = call(None).await?;
+    match first.decode(1, observation_id) {
+        Ok(action) => Ok(action),
+        Err(error) => {
+            let correction = Correction { previous: first.text(), message: correction_message(&error.message) };
+            call(Some(correction)).await?.decode(2, observation_id)
+        }
+    }
+}
+
+/// Planning time once evidence is ready. A host bridge runs an agent CLI, so it gets longer.
+const CC_MODEL_BUDGET: Duration = Duration::from_secs(95);
+const OPENAI_MODEL_BUDGET: Duration = Duration::from_secs(60);
+
+/// A phone observation with its screenshot decoded once, shared by the change
+/// fingerprint, the model size check, OCR and the binary screen route.
+#[derive(Clone, Default)]
+pub struct Observation {
+    pub value: Value,
+    pub jpeg: Option<Arc<[u8]>>,
+    /// OCR evidence computed before planning (hybrid and OCR modes).
+    pub ocr: Option<Result<Value>>,
+}
+impl Observation {
+    pub fn new(value: Value, jpeg: Option<Arc<[u8]>>) -> Self {
+        let jpeg = jpeg.or_else(|| decode_image(&value));
+        Self { value, jpeg, ocr: None }
+    }
+    pub fn from_value(value: Value) -> Self {
+        Self::new(value, None)
+    }
+}
+/// Decodes an observation's `imageBase64`, if any.
+pub fn decode_image(value: &Value) -> Option<Arc<[u8]>> {
+    let data = value["imageBase64"].as_str()?;
+    base64::engine::general_purpose::STANDARD.decode(data).ok().map(Arc::from)
+}
+
+/// What a bridge thread that already holds the earlier steps still needs.
+#[derive(Clone, Debug, Default)]
+pub struct FollowUp {
+    /// The goal, only when the thread has not seen it yet (new task or goal update).
+    pub instruction: Option<String>,
+    /// History entries added since the previous successful plan.
+    pub steps: Vec<Value>,
+}
+pub struct PlanRequest<'a> {
+    pub instruction: &'a str,
+    pub observation: &'a Observation,
+    pub history: Vec<Value>,
+    /// Sent to host bridges as `followUp`; other backends ignore it.
+    pub follow_up: Option<FollowUp>,
+    pub images: &'a [crate::attachments::ReferenceImage],
+    /// Bridge thread key (the gateway session id).
+    pub session: Option<&'a str>,
+}
+struct Evidence {
+    observation: Value,
+    image: Option<Value>,
+    references: Vec<Value>,
+    reference_parts: Vec<Value>,
+}
+impl Evidence {
+    /// Full planning content: everything a fresh model context needs.
+    fn content(&self, instruction: &str, history: &[Value]) -> Vec<Value> {
+        let mut content = vec![json!({"type":"text","text":json!({
+            "instruction":instruction,"recentHistory":history,"observation":self.observation,
+            "referenceImages":self.references,
+        }).to_string()})];
+        content.extend(self.image.iter().cloned());
+        content.extend(self.reference_parts.iter().cloned());
+        content
+    }
+    /// Compact delta for a thread that saw the earlier steps: the new
+    /// observation, its screenshot and what happened since the previous plan.
+    fn follow_up(&self, follow_up: &FollowUp) -> Vec<Value> {
+        let mut text = json!({
+            "followUp":true,"stepsSinceLastPlan":follow_up.steps,"observation":self.observation,
+            "note":"Continue the same task. stepsSinceLastPlan lists what happened since your previous reply; the observation is the current screen."
+        });
+        if let Some(instruction) = &follow_up.instruction {
+            text["instruction"] = json!(instruction);
+        }
+        let mut blocks = vec![json!({"type":"text","text":text.to_string()})];
+        blocks.extend(self.image.iter().cloned());
+        blocks
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }

@@ -134,7 +134,7 @@ impl Ocr {
                 eprintln!("event=ocr_reference_cache status=hit entries={} bytes={}", cache.entries.len(), cache.bytes);
                 return Ok(evidence);
             }
-            let evidence = self.recognize(image, None, cancel.clone()).await?;
+            let evidence = self.recognize(image, None, None, cancel.clone()).await?;
             cache.insert(hash, evidence.clone());
             eprintln!("event=ocr_reference_cache status=miss entries={} bytes={}", cache.entries.len(), cache.bytes);
             Ok(evidence)
@@ -156,7 +156,7 @@ impl Ocr {
         }
         let image = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
         let started = Instant::now();
-        let result = self.recognize(&image, None, CancellationToken::new()).await;
+        let result = self.recognize(&image, None, None, CancellationToken::new()).await;
         eprintln!(
             "event=ocr_warmup elapsed_ms={} status={}",
             started.elapsed().as_millis(),
@@ -164,14 +164,16 @@ impl Ocr {
         );
     }
 
+    /// `decoded` is the already decoded `image`, so a phone frame is not decoded again here.
     pub async fn recognize(
         &self,
         image: &str,
+        decoded: Option<&[u8]>,
         observation: Option<&Value>,
         cancel: CancellationToken,
     ) -> Result<Value> {
         let started = Instant::now();
-        let dimensions = image_dimensions(image)?;
+        let dimensions = image_dimensions(image, decoded)?;
         if cancel.is_cancelled() {
             return Err(ApiError::unavailable("OCR request cancelled"));
         }
@@ -283,13 +285,20 @@ impl Worker {
         }
     }
 }
-fn image_dimensions(image: &str) -> Result<(u32, u32)> {
+fn image_dimensions(image: &str, decoded: Option<&[u8]>) -> Result<(u32, u32)> {
     if image.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
         return Err(ApiError::unavailable("OCR image exceeds limit"));
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image)
-        .map_err(|_| ApiError::unavailable("OCR image encoding invalid"))?;
+    let owned;
+    let bytes = match decoded {
+        Some(bytes) => bytes,
+        None => {
+            owned = base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .map_err(|_| ApiError::unavailable("OCR image encoding invalid"))?;
+            &owned
+        }
+    };
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
         return Err(ApiError::unavailable("OCR image exceeds limit"));
     }
@@ -509,14 +518,14 @@ for line in sys.stdin:
         let (dir, ocr) = fixture(Duration::from_secs(3));
         let image = png();
         for _ in 0..2 {
-            ocr.recognize(&image, None, CancellationToken::new()).await.unwrap();
+            ocr.recognize(&image, None, None, CancellationToken::new()).await.unwrap();
         }
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
         assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 1);
         std::fs::write(dir.path().join("invalid"), "").unwrap();
-        assert!(ocr.recognize(&image, None, CancellationToken::new()).await.is_err());
+        assert!(ocr.recognize(&image, None, None, CancellationToken::new()).await.is_err());
         std::fs::remove_file(dir.path().join("invalid")).unwrap();
-        ocr.recognize(&image, None, CancellationToken::new()).await.unwrap();
+        ocr.recognize(&image, None, None, CancellationToken::new()).await.unwrap();
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
         assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 2);
     }
@@ -528,11 +537,11 @@ for line in sys.stdin:
         let (dir, ocr) = fixture(Duration::from_millis(1000));
         std::fs::write(dir.path().join("delay"), "").unwrap();
         assert_eq!(
-            ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap_err().message,
+            ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap_err().message,
             "OCR request timed out"
         );
         std::fs::remove_file(dir.path().join("delay")).unwrap();
-        ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap();
+        ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap();
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
         assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 2);
     }
@@ -546,7 +555,7 @@ for line in sys.stdin:
         let request = {
             let ocr = ocr.clone();
             let cancel = cancel.clone();
-            tokio::spawn(async move { ocr.recognize(&png(), None, cancel).await })
+            tokio::spawn(async move { ocr.recognize(&png(), None, None, cancel).await })
         };
         wait_for_requests(dir.path(), 1).await;
         cancel.cancel();
@@ -554,7 +563,7 @@ for line in sys.stdin:
         std::fs::remove_file(dir.path().join("delay")).unwrap();
         // The cancelled exchange completes in the background; its reply is
         // consumed there, and the same warm worker serves the next request.
-        ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap();
+        ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap();
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
         assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 1);
         assert_eq!(events.lines().filter(|line| line.ends_with(" request")).count(), 2);
@@ -567,15 +576,15 @@ for line in sys.stdin:
         std::fs::write(dir.path().join("delay"), "").unwrap();
         let active = {
             let ocr = ocr.clone();
-            tokio::spawn(async move { ocr.recognize(&png(), None, CancellationToken::new()).await })
+            tokio::spawn(async move { ocr.recognize(&png(), None, None, CancellationToken::new()).await })
         };
         wait_for_requests(dir.path(), 1).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert_eq!(ocr.recognize(&png(), None, cancel).await.unwrap_err().message, "OCR request cancelled");
+        assert_eq!(ocr.recognize(&png(), None, None, cancel).await.unwrap_err().message, "OCR request cancelled");
         std::fs::remove_file(dir.path().join("delay")).unwrap();
         active.await.unwrap().unwrap();
-        ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap();
+        ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap();
         let events = std::fs::read_to_string(dir.path().join("events")).unwrap();
         assert_eq!(events.lines().filter(|line| line.ends_with(" start")).count(), 1);
     }
@@ -585,11 +594,11 @@ for line in sys.stdin:
         let (dir, ocr) = fixture(Duration::from_secs(3));
         std::fs::write(dir.path().join("oversized"), "").unwrap();
         assert_eq!(
-            ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap_err().message,
+            ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap_err().message,
             "OCR worker response exceeds limit"
         );
         std::fs::remove_file(dir.path().join("oversized")).unwrap();
-        ocr.recognize(&png(), None, CancellationToken::new()).await.unwrap();
+        ocr.recognize(&png(), None, None, CancellationToken::new()).await.unwrap();
     }
     #[test]
     fn default_worker_supports_repo_root_and_browser_control_entrypoints() {
