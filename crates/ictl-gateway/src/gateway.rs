@@ -56,9 +56,21 @@ struct Registry {
     sessions: HashMap<String, Arc<Session>>,
     owners: HashMap<String, String>,
 }
+/// A job result. Observations carry their screenshot decoded once.
+#[derive(Clone, Debug)]
+pub(crate) struct Output {
+    pub value: Value,
+    pub jpeg: Option<Arc<[u8]>>,
+}
+impl Output {
+    fn value(value: Value) -> Self {
+        Self { value, jpeg: None }
+    }
+}
+type JobResult = watch::Sender<Option<Result<Output>>>;
 struct CachedCommand {
     fingerprint: String,
-    result: watch::Sender<Option<Result<Value>>>,
+    result: JobResult,
 }
 #[derive(Default)]
 struct Commands {
@@ -68,7 +80,7 @@ struct Commands {
 }
 struct Job {
     request: JobRequest,
-    result: watch::Sender<Option<Result<Value>>>,
+    result: JobResult,
     cancel: CancellationToken,
     queued_at: Instant,
     deadline: Option<ictl_protocol::ActionDeadline>,
@@ -83,6 +95,7 @@ struct CapturedScreen {
     at: Instant,
     fresh: bool,
     image: Value,
+    jpeg: Option<Arc<[u8]>>,
 }
 pub struct Session {
     pub id: String,
@@ -322,6 +335,7 @@ impl Session {
         }
         let _ = tokio::fs::remove_dir_all(&self.socket_dir).await;
         if let Some(g) = self.gateway.upgrade() {
+            g.model.close_session(&self.id);
             let mut registry = g.registry.lock().await;
             registry.sessions.remove(&self.id);
             registry.owners.remove(&self.namespace);
@@ -358,9 +372,9 @@ impl Session {
     }
     async fn wait_result(
         &self,
-        mut result: watch::Receiver<Option<Result<Value>>>,
+        mut result: watch::Receiver<Option<Result<Output>>>,
         cancel: CancellationToken,
-    ) -> Result<Value> {
+    ) -> Result<Output> {
         loop {
             if let Some(value) = result.borrow().clone() {
                 return value;
@@ -499,20 +513,20 @@ impl Session {
             receiver
         };
         drop(commands);
-        self.wait_result(receiver, cancel).await
+        self.wait_result(receiver, cancel).await.map(|output| output.value)
     }
     pub async fn screen(&self, cancel: CancellationToken) -> Result<Value> {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-        self.screen_admitted(cancel, None, entered, deadline, true).await
+        self.screen_admitted(cancel, None, entered, deadline, true).await.map(|output| output.value)
     }
     pub(crate) async fn task_screen(
         &self,
         cancel: CancellationToken,
         lease: &crate::control::TaskLease,
         include_elements: bool,
-    ) -> Result<Value> {
+    ) -> Result<Output> {
         let entered = Instant::now();
         let deadline =
             ictl_protocol::ActionDeadline::admit().map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
@@ -527,7 +541,7 @@ impl Session {
         queued_at: Instant,
         deadline: ictl_protocol::ActionDeadline,
         include_elements: bool,
-    ) -> Result<Value> {
+    ) -> Result<Output> {
         let admission = Some(match task {
             Some(task) => self.control.task_job(task)?,
             None => self.manual_admission()?,
@@ -583,7 +597,18 @@ impl Session {
                 admission,
             })
             .map_err(|_| ApiError::new(429, "Command queue full"))?;
-        self.wait_result(receiver, self.cancel.clone()).await
+        self.wait_result(receiver, self.cancel.clone()).await.map(|output| output.value)
+    }
+    /// The latest captured frame's image bytes, capturing first under the same
+    /// rules as the JSON preview (never during a task, which reuses its frames).
+    async fn screen_bytes(&self, queued_at: Instant, deadline: ictl_protocol::ActionDeadline) -> Result<Arc<[u8]>> {
+        self.preview_at(queued_at, deadline).await?;
+        self.latest_screen
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|frame| frame.jpeg.clone())
+            .ok_or_else(|| ApiError::new(404, "No captured screen"))
     }
     async fn cached_preview(&self) -> Value {
         self.latest_screen.lock().await.as_ref().map(|s| s.image.clone()).unwrap_or(Value::Null)
@@ -598,7 +623,7 @@ impl Session {
                 } else {
                     self.execute(job.request, job.cancel, job.deadline, job.queued_at).await
                 };
-            if let Ok(value) = &mut result
+            if let Ok(Output { value, .. }) = &mut result
                 && value.is_object()
             {
                 value["timings"]["queueMs"] = json!(queue_ms);
@@ -635,12 +660,12 @@ impl Session {
         cancel: CancellationToken,
         deadline: Option<ictl_protocol::ActionDeadline>,
         entered: Instant,
-    ) -> Result<Value> {
+    ) -> Result<Output> {
         self.check_deadline(deadline, entered, "gateway_queue")?;
         let observe = matches!(request, JobRequest::Observe { .. });
         let include_elements = matches!(request, JobRequest::Observe { include_elements: true });
         if matches!(request, JobRequest::Preview) && self.control.task_owned() {
-            return Ok(self.cached_preview().await);
+            return Ok(Output::value(self.cached_preview().await));
         }
         let controller = self.ready().await;
         self.check_deadline(deadline, entered, "gateway_ready")?;
@@ -650,7 +675,7 @@ impl Session {
             if let Some(frame) = self.latest_screen.lock().await.as_mut() {
                 frame.fresh = false;
             }
-            return native(request).await.map_err(native_error);
+            return native(request).await.map(Output::value).map_err(native_error);
         }
         let capture = Instant::now();
         let mut result = if observe {
@@ -683,11 +708,14 @@ impl Session {
                 "timings":{"screenshotMs":capture.elapsed().as_millis() as u64}})
         };
         result["capturedAt"] = json!(chrono::Utc::now().to_rfc3339());
+        // Decoded once here; the task loop, OCR and the binary screen route reuse these bytes.
+        let jpeg = crate::model::decode_image(&result);
         let mut preview = result.clone();
         preview["elementsText"] = json!("");
         preview.as_object_mut().unwrap().remove("elementsError");
-        *self.latest_screen.lock().await = Some(CapturedScreen { at: Instant::now(), fresh: true, image: preview });
-        Ok(result)
+        *self.latest_screen.lock().await =
+            Some(CapturedScreen { at: Instant::now(), fresh: true, image: preview, jpeg: jpeg.clone() });
+        Ok(Output { value: result, jpeg })
     }
     async fn snapshot(&self) -> Value {
         let native = match self.controller.get() {
@@ -757,6 +785,7 @@ impl Session {
             relay,
             pair_sender,
             self.cancel.clone(),
+            &self.socket_dir.join("mux.sock"),
         )
         .await?;
         let address = mux.address();
@@ -966,6 +995,16 @@ impl Session {
     }
 }
 
+/// Screens are JPEG; sniff the rare PNG/WebP frame instead of mislabelling it.
+fn image_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
 async fn body(request: Request<Body>) -> Result<Value> {
     body_with_limit(request, MAX_PAYLOAD).await
 }
@@ -979,6 +1018,31 @@ async fn body_with_limit(request: Request<Body>, limit: usize) -> Result<Value> 
         return Err(ApiError::new(400, "Invalid JSON body"));
     }
     Ok(value)
+}
+/// WebSocket subprotocol a relay client offers next to `ictl.token.<token>`;
+/// the gateway selects it so browsers accept the upgrade.
+const RELAY_PROTOCOL: &str = "ictl.relay";
+/// The relay session token, preferring places that stay out of URLs and access
+/// logs: an `Authorization: Bearer` header (non-browser clients), then an
+/// `ictl.token.<token>` subprotocol (browsers cannot set WebSocket headers),
+/// then the legacy `token` query parameter that `relayUrl` still carries.
+/// The flag says whether the subprotocol form was used.
+fn relay_token(headers: &axum::http::HeaderMap, url: &reqwest::Url) -> (String, bool) {
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
+    {
+        return (token.to_owned(), false);
+    }
+    let offered = headers.get_all("sec-websocket-protocol").iter().filter_map(|v| v.to_str().ok());
+    if let Some(token) =
+        offered.flat_map(|v| v.split(',')).find_map(|p| p.trim().strip_prefix("ictl.token.")).filter(|t| !t.is_empty())
+    {
+        return (token.to_owned(), true);
+    }
+    (url.query_pairs().find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()).unwrap_or_default(), false)
 }
 async fn handle(State(gateway): State<Arc<Gateway>>, request: Request<Body>) -> Response {
     let origin = request.headers().get("origin").and_then(|h| h.to_str().ok()).map(str::to_owned);
@@ -1002,7 +1066,9 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             || request.uri().path().ends_with("/setup")
             || request.uri().path().ends_with("/setup/input"))
         || request.method() == Method::GET
-            && (request.uri().path().ends_with("/screen") || request.uri().path().ends_with("/preview"));
+            && (request.uri().path().ends_with("/screen")
+                || request.uri().path().ends_with("/screen.jpg")
+                || request.uri().path().ends_with("/preview"));
     let control_deadline = control_path.then(ictl_protocol::ActionDeadline::admit);
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
@@ -1013,7 +1079,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         }
         let query = reqwest::Url::parse(&format!("http://gateway{}", request.uri()))
             .map_err(|_| ApiError::new(400, "Invalid relay URL"))?;
-        let token = query.query_pairs().find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let (token, subprotocol) = relay_token(request.headers(), &query);
         let registry = g.registry.lock().await;
         let session = registry
             .sessions
@@ -1029,6 +1095,7 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
         if session.attached.swap(true, Ordering::SeqCst) {
             return Err(ApiError::new(409, "Relay already connected"));
         }
+        let ws = if subprotocol { ws.protocols([RELAY_PROTOCOL]) } else { ws };
         return Ok(ws
             .max_message_size(MAX_PAYLOAD + 16)
             .max_frame_size(MAX_PAYLOAD + 16)
@@ -1192,7 +1259,17 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             let deadline = control_deadline
                 .expect("control route captured admission")
                 .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-            Ok(reply(200, s.screen_admitted(s.cancel.clone(), None, entered, deadline, true).await?))
+            Ok(reply(200, s.screen_admitted(s.cancel.clone(), None, entered, deadline, true).await?.value))
+        }
+        (Method::GET, ["screen.jpg"]) => {
+            let deadline = control_deadline
+                .expect("control route captured admission")
+                .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
+            let bytes = s.screen_bytes(entered, deadline).await?;
+            let mut response = Response::new(Body::from(bytes.to_vec()));
+            response.headers_mut().insert("content-type", image_type(&bytes).parse().unwrap());
+            response.headers_mut().insert("cache-control", "no-store".parse().unwrap());
+            Ok(response)
         }
         (Method::GET, ["preview"]) => {
             let deadline = control_deadline
@@ -1246,7 +1323,18 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             let model = g.model.select(input.get("model")).await?;
             let images = s.attachments.references(input.get("attachments"), &base, &s.id).await?;
             s.ready().await?;
-            Ok(reply(201, s.tasks.start(s.clone(), input["instruction"].as_str().unwrap_or(""), model, images, input["autoConfirm"] == true).await?))
+            Ok(reply(
+                201,
+                s.tasks
+                    .start(
+                        s.clone(),
+                        input["instruction"].as_str().unwrap_or(""),
+                        model,
+                        images,
+                        input["autoConfirm"] == true,
+                    )
+                    .await?,
+            ))
         }
         (Method::POST, ["tasks", task, "stop"]) => {
             if !body(request).await?.as_object().unwrap().is_empty() {
@@ -1395,6 +1483,18 @@ mod boundary_tests {
         let fresh = session.run_command(tap("fresh"), session.cancel.clone()).await.unwrap();
         assert_eq!(session.run_command(tap("fresh"), session.cancel.clone()).await.unwrap(), fresh);
         assert_eq!(sent.load(Ordering::SeqCst), 1);
+        session.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn command_ids_are_capped_per_session_without_dispatch() {
+        let (_gateway, session, sent, _dir) = fixture().await;
+        session.commands.lock().await.used.extend((0..10000).map(|n| format!("used-{n}")));
+        let error = session.run_command(tap("one-too-many"), session.cancel.clone()).await.unwrap_err();
+        assert_eq!((error.status, error.message.as_str()), (429, "Session command-ID limit reached"));
+        let replay = session.run_command(tap("used-7"), session.cancel.clone()).await.unwrap_err();
+        assert!(replay.message.contains("cannot be replayed"), "{}", replay.message);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
         session.cancel.cancel();
     }
 }

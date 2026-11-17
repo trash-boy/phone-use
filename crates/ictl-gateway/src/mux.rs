@@ -1,4 +1,6 @@
 use std::io::Cursor;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,8 +8,8 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -47,8 +49,13 @@ struct Stored {
     buid: String,
 }
 
+/// A usbmuxd endpoint for exactly one relayed device. It listens on a Unix socket
+/// (mode 0600) inside the session's private 0700 directory, never on TCP: the mux
+/// hands out the host pair record and connects to unauthenticated device ports
+/// such as WDA, so only this gateway user and its native child may reach it.
 pub struct VirtualMux {
     address: String,
+    path: PathBuf,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -60,6 +67,7 @@ impl VirtualMux {
         relay: Relay,
         pair_sender: mpsc::Sender<PairRecord>,
         cancel: CancellationToken,
+        socket_path: &Path,
     ) -> Result<Self> {
         let (bytes, buid) = match record {
             Some(record) => {
@@ -69,8 +77,15 @@ impl VirtualMux {
             None => (None, Uuid::new_v4().to_string()),
         };
         let stored = Arc::new(Mutex::new(Stored { bytes, buid }));
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let address = listener.local_addr()?.to_string();
+        // idevice reads a USBMUXD_SOCKET_ADDRESS without ':' as a Unix socket path.
+        let address = socket_path
+            .to_str()
+            .filter(|path| !path.contains(':'))
+            .ok_or_else(|| anyhow!("Invalid mux socket path"))?
+            .to_owned();
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path)?;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
         let task_cancel = cancel.child_token();
         let serving_cancel = task_cancel.clone();
         let task = tokio::spawn(async move {
@@ -100,7 +115,7 @@ impl VirtualMux {
             connections.abort_all();
             while connections.join_next().await.is_some() {}
         });
-        Ok(Self { address, cancel: task_cancel, task: Mutex::new(Some(task)) })
+        Ok(Self { address, path: socket_path.to_owned(), cancel: task_cancel, task: Mutex::new(Some(task)) })
     }
 
     pub fn address(&self) -> String {
@@ -112,6 +127,7 @@ impl VirtualMux {
         if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -135,7 +151,7 @@ fn number(value: &Dictionary, name: &str) -> Option<u64> {
     value.get(name).and_then(Value::as_unsigned_integer)
 }
 
-async fn send(socket: &mut TcpStream, value: Value, tag: u32) -> Result<()> {
+async fn send(socket: &mut (impl AsyncWrite + Unpin), value: Value, tag: u32) -> Result<()> {
     let mut payload = Vec::new();
     value.to_writer_xml(&mut payload)?;
     if payload.len() > MAX_PAYLOAD - 16 {
@@ -150,7 +166,7 @@ async fn send(socket: &mut TcpStream, value: Value, tag: u32) -> Result<()> {
     Ok(())
 }
 
-async fn result(socket: &mut TcpStream, code: u64, tag: u32) -> Result<()> {
+async fn result(socket: &mut (impl AsyncWrite + Unpin), code: u64, tag: u32) -> Result<()> {
     send(socket, dict([("MessageType", string("Result")), ("Number", integer(code))]), tag).await
 }
 
@@ -172,7 +188,7 @@ fn attached(device: &Device) -> Value {
 }
 
 async fn serve(
-    mut socket: TcpStream,
+    mut socket: UnixStream,
     device: Device,
     stored: Arc<Mutex<Stored>>,
     relay: Relay,
@@ -252,7 +268,7 @@ async fn serve(
     }
 }
 
-async fn read_packet(socket: &mut TcpStream) -> Result<(Value, u32)> {
+async fn read_packet(socket: &mut (impl AsyncRead + Unpin)) -> Result<(Value, u32)> {
     let mut head = [0; 16];
     socket.read_exact(&mut head).await?;
     let number = |start| u32::from_le_bytes(head[start..start + 4].try_into().expect("bounded header"));
@@ -267,8 +283,8 @@ async fn read_packet(socket: &mut TcpStream) -> Result<(Value, u32)> {
 }
 
 /// Connect to the one device owned by this virtual mux. Never accepts a host from an API request.
-pub(crate) async fn connect_port(address: &str, port: u16) -> Result<TcpStream> {
-    let mut socket = TcpStream::connect(address).await?;
+pub(crate) async fn connect_port(address: &str, port: u16) -> Result<UnixStream> {
+    let mut socket = UnixStream::connect(address).await?;
     send(
         &mut socket,
         dict([
@@ -318,8 +334,13 @@ mod tests {
             product_id: 4776,
             product_name: None,
         };
-        let mux = VirtualMux::start(device.clone(), None, relay, pair_sender, CancellationToken::new()).await.unwrap();
-        let mut socket = TcpStream::connect(mux.address()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mux.sock");
+        let mux =
+            VirtualMux::start(device.clone(), None, relay, pair_sender, CancellationToken::new(), &path).await.unwrap();
+        assert_eq!(mux.address(), path.to_str().unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut socket = UnixStream::connect(mux.address()).await.unwrap();
         send(&mut socket, dict([("MessageType", string("ListDevices"))]), 7).await.unwrap();
         let (reply, tag) = read_packet(&mut socket).await.unwrap();
         assert_eq!(tag, 7);
@@ -334,5 +355,6 @@ mod tests {
         assert!(!reply.as_dictionary().unwrap()["BUID"].as_string().unwrap().is_empty());
         mux.close().await;
         assert!(socket.read_u8().await.is_err());
+        assert!(!path.exists(), "closing the mux removes its socket");
     }
 }
