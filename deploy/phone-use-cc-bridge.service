@@ -1,23 +1,35 @@
 # Optional host service. Review and install explicitly; CI never installs it.
-# Run as the account already authenticated with Claude Code.
+# A systemd user service of the account already authenticated with Claude Code (see deploy/README.md):
+#   install -D -m 0755 browser-control/cc/bridge.py ~/apps/phone-use-cc-bridge/bridge.py
+#   cp deploy/phone-use-cc-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now phone-use-cc-bridge
+#   loginctl enable-linger "$USER"     # keep running without a login session
+# %h is that account's home. Other paths: `systemctl --user edit phone-use-cc-bridge`, then clear and
+# redefine ExecStart= in the drop-in (an empty `ExecStart=` line first).
 [Unit]
 Description=Phone Use Claude Code planner bridge
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-User=liuyang
-Group=liuyang
-WorkingDirectory=/home/liuyang/apps/phone-use-cc-bridge
-EnvironmentFile=-/home/liuyang/.config/phone-use-cc-bridge.env
-ExecStart=/usr/bin/python3 -I /home/liuyang/apps/phone-use-cc-bridge/bridge.py --socket /srv/containers/iphone-control/cc/bridge.sock --work-dir /srv/containers/iphone-control/cc/work --claude-bin /home/liuyang/.local/bin/claude
+WorkingDirectory=%h/apps/phone-use-cc-bridge
+EnvironmentFile=-%h/.config/phone-use-cc-bridge.env
+ExecStart=/usr/bin/python3 -I %h/apps/phone-use-cc-bridge/bridge.py --socket /srv/containers/iphone-control/cc/bridge.sock --work-dir /srv/containers/iphone-control/cc/work --claude-bin %h/.local/bin/claude
 Restart=on-failure
 RestartSec=5
 UMask=0077
 TimeoutStopSec=15
 KillMode=control-group
-NoNewPrivileges=true
+NoNewPrivileges=yes
+# At most two planning CLIs and one pre-started CLI at a time.
+MemoryMax=3G
+# PrivateTmp=, ProtectSystem=strict and ReadWritePaths= are left out: in a user service they need an
+# unprivileged user namespace (systemd then implies PrivateUsers=), which many hosts restrict (Ubuntu's
+# AppArmor userns restriction, kernel.unprivileged_userns_clone=0), and the unit would fail to start.
+# Where `unshare -Ur true` works for this account they can be added in a drop-in:
+#   PrivateTmp=yes
+#   ProtectSystem=strict
+#   ReadWritePaths=/srv/containers/iphone-control/cc %h/.claude %h/.claude.json %h/.cache %h/.local/state
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
