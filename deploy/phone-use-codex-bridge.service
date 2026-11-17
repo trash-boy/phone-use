@@ -1,36 +1,26 @@
 # Optional host service. Review and install explicitly; CI never installs it.
-# A systemd user service of the account whose Codex CLI is configured (~/.codex/config.toml; see deploy/README.md):
-#   install -D -m 0755 browser-control/cc/bridge.py ~/apps/phone-use-codex-bridge/bridge.py
-#   cp deploy/phone-use-codex-bridge.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now phone-use-codex-bridge
-#   loginctl enable-linger "$USER"     # keep running without a login session
-# %h is that account's home. Other paths or model: `systemctl --user edit phone-use-codex-bridge`, then
-# clear and redefine ExecStart= in the drop-in (an empty `ExecStart=` line first).
+# User=/paths below are this VPS's; adjust them for another host.
+# Run as the account whose Codex CLI is already configured (~/.codex/config.toml).
 [Unit]
 Description=Phone Use Codex agent planner bridge
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/apps/phone-use-codex-bridge
-EnvironmentFile=-%h/.config/phone-use-codex-bridge.env
-ExecStart=/usr/bin/python3 -I %h/apps/phone-use-codex-bridge/bridge.py --socket /srv/containers/iphone-control/codex/bridge.sock --work-dir /srv/containers/iphone-control/codex/work --codex-bin %h/.local/bin/codex --codex-model gpt-6-luna --reasoning-effort low --codex-mode app-server
+User=liuyang
+Group=liuyang
+WorkingDirectory=/home/liuyang/apps/phone-use-codex-bridge
+EnvironmentFile=-/home/liuyang/.config/phone-use-codex-bridge.env
+ExecStart=/usr/bin/python3 -I /home/liuyang/apps/phone-use-codex-bridge/bridge.py --socket /srv/containers/iphone-control/codex/bridge.sock --work-dir /srv/containers/iphone-control/codex/work --codex-bin /home/liuyang/.local/bin/codex --codex-model gpt-6-luna --reasoning-effort low --codex-mode app-server
 Restart=on-failure
 RestartSec=5
 UMask=0077
 TimeoutStopSec=15
 KillMode=control-group
-NoNewPrivileges=yes
-# The long-lived app-server holds every loaded thread; the bridge also recycles it (see bridge.py).
+NoNewPrivileges=true
+# Caps runaway planner memory (the Codex app-server keeps loaded threads; the bridge also recycles it).
 MemoryMax=4G
-# PrivateTmp=, ProtectSystem=strict and ReadWritePaths= are left out: in a user service they need an
-# unprivileged user namespace (systemd then implies PrivateUsers=), which many hosts restrict (Ubuntu's
-# AppArmor userns restriction, kernel.unprivileged_userns_clone=0), and the unit would fail to start;
-# Codex's own Linux sandbox may also need namespaces of its own. Where `unshare -Ur true` works for
-# this account they can be added in a drop-in:
-#   PrivateTmp=yes
-#   ProtectSystem=strict
-#   ReadWritePaths=/srv/containers/iphone-control/codex %h/.codex
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
