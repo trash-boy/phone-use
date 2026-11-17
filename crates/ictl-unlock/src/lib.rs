@@ -369,12 +369,9 @@ async fn enter_rest<T: Transport>(
 }
 
 #[cfg(test)]
-mod fake;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use fake::FakeLockScreen;
+    use ictl_wda::fake::FakeLockScreen;
 
     fn cfg(passcode: Option<&str>) -> (UnlockConfig, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ictl-unlock-{}", uuid::Uuid::new_v4()));
