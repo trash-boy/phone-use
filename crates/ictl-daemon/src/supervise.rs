@@ -32,6 +32,34 @@ const SESSION_CHECK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// 换了设备或重新接上后，这么久内就检查一次要不要重签（离线期间可能过期了，不能等满 RESIGN_CHECK_HOURS）
 const RESIGN_CHECK_AFTER_CONNECT: Duration = Duration::from_secs(60);
 
+/// 刚拉起 usbmuxd 后等这么久再列设备（让它建好 socket）。在锁外等
+const USBMUXD_SETTLE: Duration = Duration::from_secs(1);
+/// 巡检时 WDA 旋转角旧于这么久才重读：到下一轮巡检（10 秒后）它还在 HID 能用的时限（30 秒）内
+const ROTATION_REFRESH_AFTER: Duration =
+    Duration::from_secs(crate::tools::HID_ROTATION_MAX_AGE.as_secs() - crate::core::TICK.as_secs() - 5);
+
+/// 巡检要在锁外做的 WDA 健康探测：只带传输的副本（`/status` 走自己的连接，不碰请求用的连接池）和当时的代数
+pub(crate) struct HealthCheck {
+    generation: u64,
+    udid: String,
+    /// 本进程 runner 活着时 WDA 客户端传输的副本；None 表示不用探测（没有 runner 或 runner 已退出）
+    link: Option<crate::core::WdaLink>,
+    device: Device,
+    bundle: String,
+}
+
+impl HealthCheck {
+    /// 问一次 `/status`，返回结果和用时
+    pub(crate) async fn probe(&self) -> (ictl_wda::Result<bool>, Duration) {
+        let started = Instant::now();
+        let health = match &self.link {
+            Some(link) => WdaClient::new(link.clone()).ready().await,
+            None => Ok(false),
+        };
+        (health, started.elapsed())
+    }
+}
+
 /// 后台启动 WDA 的结果
 pub(crate) enum StartOutcome {
     Ready {
@@ -52,9 +80,11 @@ pub(crate) enum StartOutcome {
 impl Daemon {
     // ------------------------------------------------------------------ usbmuxd
 
-    pub(crate) async fn ensure_usbmuxd(&self, g: &mut Inner, restart: bool) {
+    /// 看护 usbmuxd：退出了就（按退避）重新拉起，`restart` 时强制重启。返回 true 表示刚拉起，
+    /// 要等它建好 socket（[`USBMUXD_SETTLE`]）再列设备；调用方在锁外等，不持锁睡
+    pub(crate) async fn ensure_usbmuxd(&self, g: &mut Inner, restart: bool) -> bool {
         if !self.cfg.manage_usbmuxd {
-            return;
+            return false;
         }
         let exited = match g.usbmuxd.as_mut().map(|c| c.try_wait()) {
             Some(Ok(None)) => None,
@@ -63,7 +93,7 @@ impl Daemon {
             None => Some(String::new()),
         };
         if exited.is_none() && !restart {
-            return;
+            return false;
         }
         if !restart {
             // 起来就退出（例如宿主机上已有 usbmuxd 占着 socket）：退避重试，不要每 10 秒拆一次会话、写一行日志
@@ -79,7 +109,7 @@ impl Daemon {
                 ));
             }
             if g.usbmuxd_retry_at.is_some_and(|t| Instant::now() < t) {
-                return;
+                return false;
             }
         }
         // 经旧 usbmuxd 建立的连接（隧道、runner、WDA）都要失效：先停 HID 媒体流（还要经它），再停它
@@ -103,70 +133,131 @@ impl Daemon {
                     g.usbmuxd_delay = Duration::ZERO;
                 }
                 self.log.log("usbmuxd 已(重新)启动");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                true
             }
-            Err(e) => self.log.log(&format!("启动 usbmuxd 失败：{e}")),
+            Err(e) => {
+                self.log.log(&format!("启动 usbmuxd 失败：{e}"));
+                false
+            }
         }
     }
 
     // ------------------------------------------------------------------ 状态机
 
-    /// 每 10 秒一次。有请求在用设备就跳过这一轮（巡检不排队，下一轮再来）
+    /// 每 10 秒一次。有请求在用设备就跳过这一轮（巡检不排队，下一轮再来）。
+    ///
+    /// 持锁只做改状态的部分，分几段：
+    /// 1. 持锁：看护 usbmuxd、关空闲的 HID 会话、收后台启动 WDA 的结果
+    /// 2. 不持锁：（刚拉起 usbmuxd 时先等它）列设备、数 sysfs 上的 iPhone/iPad
+    /// 3. 持锁：推进状态机；要查 WDA 健康时只取出传输的副本和代数（[`HealthCheck`]）
+    /// 4. 不持锁：`/status`（走单独的连接，最长约 15 秒）
+    /// 5. 持锁：代数还对得上才用探测结果，再安排重签、会话检查
     pub async fn tick(self: Arc<Self>) {
-        let Ok(mut g) = self.inner.try_lock() else {
-            self.diagnostics.lock().unwrap().skip();
-            return;
+        let started_usbmuxd = {
+            let Ok(mut g) = self.inner.try_lock() else {
+                crate::diagnostics::lock(&self.diagnostics).skip();
+                return;
+            };
+            let g = &mut *g;
+            let started = self.ensure_usbmuxd(g, false).await;
+            if g.tunnel.as_ref().is_some_and(Tunnel::hid_open) && g.hid_used.is_none_or(|t| t.elapsed() >= HID_IDLE) {
+                close_hid(g).await;
+                tracing::info!("HID 会话空闲，已关闭（停止屏幕媒体流）");
+            }
+            self.poll_start(g).await;
+            if started {
+                self.publish(g);
+            }
+            started
         };
-        let g = &mut *g;
-        self.ensure_usbmuxd(g, false).await;
-
-        if g.tunnel.as_ref().is_some_and(Tunnel::hid_open) && g.hid_used.is_none_or(|t| t.elapsed() >= HID_IDLE) {
-            close_hid(g).await;
-            tracing::info!("HID 会话空闲，已关闭（停止屏幕媒体流）");
+        if started_usbmuxd {
+            tokio::time::sleep(USBMUXD_SETTLE).await;
         }
-        self.poll_start(g).await;
-
-        let devices = match ictl_device::list_devices().await {
-            Ok(d) => {
-                g.list_errors = 0;
-                d
-            }
-            Err(e) => {
-                // usbmuxd 抖一下就当离线会拆掉整个会话：连续几轮都失败才算
-                g.list_errors += 1;
-                tracing::debug!("列设备失败（第 {} 次）：{e}", g.list_errors);
-                if g.list_errors < LIST_ERRORS_OFFLINE {
-                    self.publish(g);
-                    return;
-                }
-                Vec::new()
-            }
-        };
-        self.note_connected(g, devices).await;
-        let pinned = self.pinned(g);
-        let udids: Vec<&str> = g.connected.iter().map(|d| d.udid.as_str()).collect();
-        let current = g.device.as_ref().map(|d| d.udid.as_str());
-        let target = crate::machine::pick_device(&udids, pinned.as_deref(), current).map(|i| g.connected[i].clone());
-        // 只在容器里（自己看护 usbmuxd、没有 udev）需要；用系统的 usbmuxd 服务时插拔由 udev 处理，也重启不了它
+        let listed = ictl_device::list_devices().await;
         let on_usb = ictl_device::ios_usb_count(Path::new(SYSFS_USB));
-        if self.cfg.manage_usbmuxd && g.mux.observe(on_usb, g.connected.len()) {
-            self.log
-                .log(&format!("USB 上有 {on_usb} 台 iPhone/iPad,usbmuxd 只认到 {} 台,重启 usbmuxd", g.connected.len()));
-            self.ensure_usbmuxd(g, true).await;
-        }
 
-        match target {
-            None => self.offline(g).await,
-            Some(d) => {
-                self.online(g, &d).await;
-                self.adopt_legacy_passcode(g);
+        let check = {
+            let Some(mut g) = self.relock().await else { return };
+            let g = &mut *g;
+            let devices = match listed {
+                Ok(d) => {
+                    g.list_errors = 0;
+                    d
+                }
+                Err(e) => {
+                    // usbmuxd 抖一下就当离线会拆掉整个会话：连续几轮都失败才算
+                    g.list_errors += 1;
+                    tracing::debug!("列设备失败（第 {} 次）：{e}", g.list_errors);
+                    if g.list_errors < LIST_ERRORS_OFFLINE {
+                        self.publish(g);
+                        return;
+                    }
+                    Vec::new()
+                }
+            };
+            self.note_connected(g, devices).await;
+            let pinned = self.pinned(g);
+            let udids: Vec<&str> = g.connected.iter().map(|d| d.udid.as_str()).collect();
+            let current = g.device.as_ref().map(|d| d.udid.as_str());
+            let target =
+                crate::machine::pick_device(&udids, pinned.as_deref(), current).map(|i| g.connected[i].clone());
+            // 只在容器里（自己看护 usbmuxd、没有 udev）需要；用系统的 usbmuxd 服务时插拔由 udev 处理，也重启不了它
+            if self.cfg.manage_usbmuxd && g.mux.observe(on_usb, g.connected.len()) {
+                self.log.log(&format!(
+                    "USB 上有 {on_usb} 台 iPhone/iPad,usbmuxd 只认到 {} 台,重启 usbmuxd",
+                    g.connected.len()
+                ));
+                // 刚拉起的 usbmuxd 还没认到设备，这一轮的列表作废，下一轮再看
+                self.ensure_usbmuxd(g, true).await;
+                self.publish(g);
+                return;
+            }
+            let check = match target {
+                None => {
+                    self.offline(g).await;
+                    None
+                }
+                Some(d) => {
+                    let check = self.online(g, &d).await;
+                    self.adopt_legacy_passcode(g);
+                    check
+                }
+            };
+            if check.is_none() {
+                self.schedule_background(g);
+                self.publish(g);
+                return;
+            }
+            check
+        };
+        let Some(check) = check else { return };
+        let health = check.probe().await;
+        let Some(mut g) = self.relock().await else { return };
+        let g = &mut *g;
+        self.apply_health(g, check, health).await;
+        self.schedule_background(g);
+        self.publish(g);
+    }
+
+    /// 巡检在锁外做完一段之后重新拿锁。请求正占着时等它做完（最多一轮巡检的时间），等不到就放弃这一轮
+    async fn relock(&self) -> Option<tokio::sync::MutexGuard<'_, Inner>> {
+        match tokio::time::timeout(crate::core::TICK, self.inner.lock()).await {
+            Ok(g) => Some(g),
+            Err(_) => {
+                crate::diagnostics::lock(&self.diagnostics).skip();
+                None
             }
         }
+    }
 
+    /// 到时间就在后台做重签检查、验证 Apple ID 会话
+    fn schedule_background(self: &Arc<Self>, g: &mut Inner) {
         let now = Instant::now();
-        if now >= g.next_resign {
+        // 正在重签时有强制重签在等：不取走标记、不推迟，等这次重签结束后下一轮再来
+        // （否则这次检查只会返回「正在重签」，标记就丢了）
+        if now >= g.next_resign && !(g.resigning && g.resign_force_pending) {
             g.next_resign = now + self.cfg.resign_check;
-            if g.device.is_some() && g.persisted.wda_bundle.is_some() {
+            if g.device.is_some() && g.persisted.wda_bundle.is_some() && !g.resigning {
                 let force = std::mem::take(&mut g.resign_force_pending);
                 let d = self.clone();
                 tokio::task::spawn_local(async move {
@@ -181,7 +272,6 @@ impl Daemon {
             g.next_session_check = now + self.cfg.session_check;
             tokio::task::spawn_local(self.clone().check_session());
         }
-        self.publish(g);
     }
 
     async fn offline(&self, g: &mut Inner) {
@@ -204,10 +294,13 @@ impl Daemon {
         }
     }
 
-    pub(crate) async fn online(&self, g: &mut Inner, seen: &UsbDevice) {
+    /// 持锁推进在线设备的状态机，直到要查 WDA 健康为止：返回要在锁外做的探测（[`HealthCheck`]）；
+    /// 在前面某一步就有了结论（没配对、没签名……）返回 None
+    pub(crate) async fn online(&self, g: &mut Inner, seen: &UsbDevice) -> Option<HealthCheck> {
         // 只比 UDID 不够：断开几秒又接上（短于离线判定、落在两轮巡检之间）时 UDID 不变，
         // usbmuxd 却换了编号，旧句柄的每个连接都报 bad device，永远恢复不了
-        if !g.device.as_ref().is_some_and(|d| d.is_connection(seen)) {
+        let fresh = !g.device.as_ref().is_some_and(|d| d.is_connection(seen));
+        if fresh {
             match g.device.take() {
                 Some(old) if old.udid == seen.udid => self.log.log(&format!(
                     "手机重新接入（usbmuxd 编号 {} → {}），重建连接",
@@ -242,52 +335,92 @@ impl Daemon {
         }
         let device = g.device.clone().expect("刚设置过");
 
-        match device.paired().await {
-            Ok(true) => {
-                if g.device_profile == DeviceProfile::NotChecked {
-                    self.refresh_device_profile(g).await;
+        // 就绪时不再每轮查配对记录、开发者模式：WDA 能用就说明都好着。刚换的连接照常查
+        let settled = g.state == DeviceState::Ready && !fresh;
+        if !settled {
+            match device.paired().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.set_state(g, DeviceState::NeedsTrust);
+                    return None;
+                }
+                // usbmuxd 出错：这一轮不下结论
+                Err(e) => {
+                    tracing::debug!("查配对记录失败：{e}");
+                    return None;
                 }
             }
-            Ok(false) => return self.set_state(g, DeviceState::NeedsTrust),
-            // usbmuxd 出错：这一轮不下结论
-            Err(e) => return tracing::debug!("查配对记录失败：{e}"),
         }
-        if g.state != DeviceState::Ready {
+        if g.device_profile == DeviceProfile::NotChecked {
+            self.refresh_device_profile(g).await;
+        }
+        if !settled {
             match device.developer_mode_enabled().await {
-                Ok(false) => return self.set_state(g, DeviceState::DeveloperModeOff),
+                Ok(false) => {
+                    self.set_state(g, DeviceState::DeveloperModeOff);
+                    return None;
+                }
                 Ok(true) => {}
                 // 查不到时照常往下走（WDA 能起来就说明开着），但要留下原因
                 Err(e) => tracing::warn!(event = "developer_mode_query_failed", error = %e),
             }
         }
         let Some(bundle) = g.persisted.wda_bundle.clone() else {
-            return self.set_state(g, DeviceState::NeedsSigning);
+            self.set_state(g, DeviceState::NeedsSigning);
+            return None;
         };
-
-        // WDA 健康：本进程的 runner 还活着，且 /status ready
         let runner_alive = g.runner.as_ref().is_some_and(|r| r.alive());
-        let health_started = Instant::now();
-        let health = match (&g.wda, runner_alive) {
-            (Some(w), true) => w.ready().await,
-            _ => Ok(false),
-        };
+        let link = g.wda.as_ref().filter(|_| runner_alive).map(|w| w.transport().clone());
+        Some(HealthCheck { generation: g.wda_generation, udid: device.udid.clone(), link, device, bundle })
+    }
+
+    /// 请求里（已经持锁）推进：探测也在锁里做（[`Self::online`] → [`HealthCheck::probe`] → [`Self::apply_health`]）
+    pub(crate) async fn online_now(&self, g: &mut Inner, seen: &UsbDevice) {
+        if let Some(check) = self.online(g, seen).await {
+            let health = check.probe().await;
+            self.apply_health(g, check, health).await;
+        }
+    }
+
+    /// 用锁外探测到的 WDA 健康推进状态机。探测期间换了客户端或设备（代数变了）就作废，下一轮再查
+    pub(crate) async fn apply_health(
+        &self,
+        g: &mut Inner,
+        check: HealthCheck,
+        probe: (ictl_wda::Result<bool>, Duration),
+    ) {
+        let (mut health, probe_time) = probe;
+        if g.wda_generation != check.generation || g.device.as_ref().map(|d| d.udid.as_str()) != Some(&check.udid) {
+            tracing::debug!(event = "wda_health_discarded", reason = "session changed during the probe");
+            return;
+        }
+        // WDA 健康：本进程的 runner 还活着，且 /status ready。探测期间 runner 退出了也不算就绪
+        let runner_alive = check.link.is_some() && g.runner.as_ref().is_some_and(|r| r.alive());
+        if !runner_alive {
+            health = Ok(false);
+        }
         if let (Some(runner), Some(_)) = (&g.runner, &g.wda)
             && runner_alive
         {
             let evidence = runner.diagnostics();
             let identity = evidence.snapshot().identity;
             let category = health_failure(&health).0;
-            let mut d = self.diagnostics.lock().unwrap();
-            let recovered = d.complete(identity.runner_id, health_started.elapsed(), category);
+            let mut d = crate::diagnostics::lock(&self.diagnostics);
+            let recovered = d.complete(identity.runner_id, probe_time, category);
             let snapshot = d.snapshot();
-            tracing::info!(event="wda_health_completed", scope="wda_status", native_pid=identity.native_pid, native_start_id=%identity.native_start_id, runner_id=identity.runner_id, phone_pid=?evidence.snapshot().phone_pid, sequence=snapshot.last_probe.as_ref().map(|p|p.sequence), duration_ms=health_started.elapsed().as_millis() as u64, category, consecutive_failures=snapshot.consecutive_failures, last_success_age_ms=?snapshot.last_success.as_ref().map(|p|p.age_ms));
+            tracing::info!(event="wda_health_completed", scope="wda_status", native_pid=identity.native_pid, native_start_id=%identity.native_start_id, runner_id=identity.runner_id, phone_pid=?evidence.snapshot().phone_pid, sequence=snapshot.last_probe.as_ref().map(|p|p.sequence), duration_ms=probe_time.as_millis() as u64, category, consecutive_failures=snapshot.consecutive_failures, last_success_age_ms=?snapshot.last_success.as_ref().map(|p|p.age_ms));
             if recovered {
                 evidence.event("wda_health_recovered");
             }
         }
         if matches!(health, Ok(true)) {
             g.wda_misses.reset();
-            self.refresh_hid_rotation(g).await;
+            g.wda_link_down.reset();
+            g.wda_unreachable_until = None;
+            // 旋转角只给 WDA 短暂掉线时的 HID 用，30 秒内有效：快过期了才重读，不是每轮都问
+            if g.wda_rotation.is_none_or(|(at, _)| at.elapsed() >= ROTATION_REFRESH_AFTER) {
+                self.refresh_hid_rotation(g).await;
+            }
             if g.state != DeviceState::Ready {
                 if g.state == DeviceState::NeedsAutomationPin || g.dedup.was_sent("pin") {
                     g.dedup.clear("pin");
@@ -306,14 +439,18 @@ impl Daemon {
             }
             return;
         }
+        let mut link_down_restart = false;
         if runner_alive {
             let (category, response_failure) = health_failure(&health);
+            let unreachable = matches!(health, Err(WdaError::Unavailable(_)));
             let now = Instant::now();
+            // 连得上但答得不对：按 Misses 判断；连不上：短暂的不算，持续太久（LinkDown）才算
+            link_down_restart = g.wda_link_down.observe(now, unreachable);
             let restart = if response_failure {
                 g.wda_misses.hit(now)
             } else {
                 g.wda_misses.reset();
-                false
+                link_down_restart
             };
             tracing::info!(
                 event = "wda_health_failed",
@@ -324,6 +461,7 @@ impl Daemon {
                 consecutive_failures = g.wda_misses.count(),
                 failure_window_ms = g.wda_misses.elapsed(now).as_millis() as u64,
                 confirm_window_ms = crate::machine::Misses::CONFIRM_WINDOW.as_millis() as u64,
+                link_down_ms = g.wda_link_down.elapsed(now).as_millis() as u64,
                 restart,
                 runner_alive = true
             );
@@ -333,12 +471,13 @@ impl Daemon {
         }
         if g.runner.is_some() {
             let reason = g.runner.as_ref().and_then(WdaRunner::exit_reason).unwrap_or_else(|| {
-                if runner_alive {
-                    "sustained WDA response failures (at least 3 probes over 60 seconds)"
+                if link_down_restart {
+                    format!("WDA unreachable for over {} seconds", crate::machine::LINK_DOWN_RESTART.as_secs())
+                } else if runner_alive {
+                    "sustained WDA response failures (at least 3 probes over 60 seconds)".to_owned()
                 } else {
-                    "runner task finished"
+                    "runner task finished".to_owned()
                 }
-                .to_owned()
             });
             self.log.log(&format!("WDA 不可用 event=wda_restart runner_alive={runner_alive} reason={reason}"));
             // 隧道和 HID 也一起丢：WDA 掉线常常是底层连接断了（例如 usbmuxd 重启），
@@ -349,7 +488,7 @@ impl Daemon {
         if g.starting.is_some() || !g.backoff.ready(Instant::now()) {
             return;
         }
-        self.spawn_start(g, device, bundle);
+        self.spawn_start(g, check.device, check.bundle);
     }
 
     /// 在后台启动 WDA：挂开发者镜像（单独开一条隧道，用完关掉）→ 启动 runner 等就绪。
@@ -362,7 +501,7 @@ impl Daemon {
         self.log.log("启动 WDA");
         let (cache, url, user_dir) = (self.cfg.ddi_cache(), self.cfg.ddi_url.clone(), self.cfg.ddi_dir.clone());
         let diagnostics = WdaRunner::diagnostic_session();
-        self.diagnostics.lock().unwrap().set_runner(diagnostics.clone());
+        crate::diagnostics::lock(&self.diagnostics).set_runner(diagnostics.clone());
         g.starting = Some(tokio::task::spawn_local(async move {
             // 手机重启后开发者镜像可能掉了；已挂载时只是一次查询。错误带上「是不是挂载这一步」
             let ddi: Result<Option<String>, (DeviceError, bool)> = async {
@@ -419,10 +558,14 @@ impl Daemon {
                 }
                 g.ddi_failures = 0;
                 g.runner = Some(runner);
+                g.wda_generation += 1;
+                g.wda_unreachable_until = None;
+                g.wda_link_down.reset();
                 g.wda = Some(
                     client
                         .with_low_latency(self.cfg.low_latency)
-                        .with_bounded_capture(self.cfg.capture_policy == crate::config::CapturePolicy::BoundedRemote),
+                        .with_bounded_capture(self.cfg.capture_policy == crate::config::CapturePolicy::BoundedRemote)
+                        .map_transport(crate::core::WdaLink::Device),
                 );
                 // 状态在下面 online() 的健康检查里变成 Ready
             }
@@ -662,6 +805,196 @@ async fn mount_personalized(device: &Device, cache: &Path) -> Result<Option<Stri
     let dir = ictl_device::ddi::ensure_personalized_cache(&dir, ictl_device::ddi::PERSONALIZED_BASE_URL).await?;
     device.mount_personalized_ddi(&dir).await?;
     Ok(Some("Personalized".into()))
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::testkit;
+    use ictl_wda::fake::Reply;
+
+    fn usb() -> UsbDevice {
+        UsbDevice { udid: "00008130-TEST".into(), device_id: 7 }
+    }
+
+    /// 模拟 online() 交出来的探测（不经 usbmuxd）：当前代数、当前设备、当前 WDA 的传输
+    fn check(g: &mut Inner) -> HealthCheck {
+        let device = g.device.clone().unwrap();
+        let alive = g.runner.as_ref().is_some_and(|r| r.alive());
+        HealthCheck {
+            generation: g.wda_generation,
+            udid: device.udid.clone(),
+            link: g.wda.as_ref().filter(|_| alive).map(|w| w.transport().clone()),
+            device,
+            bundle: "com.example.WebDriverAgentRunner.xctrunner".into(),
+        }
+    }
+
+    fn prepare(g: &mut Inner, fake: &ictl_wda::fake::ScriptedWda) {
+        g.device = Some(Device::from_usb(&usb()));
+        testkit::attach(g, fake);
+        // 不在测试里真去拉起 WDA
+        g.backoff.failed(Instant::now());
+    }
+
+    #[tokio::test]
+    async fn healthy_probe_makes_the_device_ready_and_records_the_screen() {
+        let (d, dir) = testkit::daemon("ready");
+        let fake = testkit::healthy_wda();
+        let mut g = d.inner.lock().await;
+        prepare(&mut g, &fake);
+        g.state = DeviceState::WdaStarting { last_error: None };
+        g.wda_unreachable_until = Some(Instant::now() + Duration::from_secs(60));
+        let c = check(&mut g);
+        let health = c.probe().await;
+        assert!(matches!(health.0, Ok(true)));
+        d.apply_health(&mut g, c, health).await;
+        assert_eq!(g.state, DeviceState::Ready);
+        assert!(g.wda_unreachable_until.is_none(), "a ready probe closes the request breaker");
+        assert!(g.wda_rotation.is_some());
+        assert_eq!(g.persisted.screen.map(|s| s.width), Some(430.0));
+        // 旋转角还新：下一轮不再问
+        let rotations = fake.count("GET", "/rotation");
+        let c = check(&mut g);
+        let health = c.probe().await;
+        d.apply_health(&mut g, c, health).await;
+        assert_eq!(fake.count("GET", "/rotation"), rotations);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 探测期间 WDA 客户端换了（代数变了）：结果作废，不改状态
+    #[tokio::test]
+    async fn probe_result_is_discarded_when_the_session_changed_meanwhile() {
+        let (d, dir) = testkit::daemon("stale-probe");
+        let fake = testkit::healthy_wda();
+        fake.on("GET", "/status", Reply::Json(500, serde_json::json!({"value": {"error": "x", "message": "x"}})));
+        let mut g = d.inner.lock().await;
+        prepare(&mut g, &fake);
+        g.state = DeviceState::Ready;
+        let c = check(&mut g);
+        let health = c.probe().await;
+        testkit::attach(&mut g, &fake);
+        d.apply_health(&mut g, c, health).await;
+        assert_eq!(g.wda_misses.count(), 0);
+        assert!(g.runner.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// runner 活着、WDA 一直连不上：短暂的不算（Misses 清零、状态不变），持续超过 LINK_DOWN_RESTART 才重启
+    #[tokio::test]
+    async fn sustained_unreachable_wda_with_a_live_runner_is_restarted() {
+        let (d, dir) = testkit::daemon("link-down");
+        let fake = testkit::healthy_wda();
+        fake.on("GET", "/status", Reply::unavailable());
+        let mut g = d.inner.lock().await;
+        prepare(&mut g, &fake);
+        g.state = DeviceState::Ready;
+        let c = check(&mut g);
+        let health = c.probe().await;
+        assert!(matches!(health.0, Err(WdaError::Unavailable(_))));
+        d.apply_health(&mut g, c, health).await;
+        assert!(g.runner.is_some(), "a brief link failure keeps the runner");
+        assert_eq!(g.wda_misses.count(), 0);
+        // 假装已经连不上很久了
+        g.wda_link_down.reset();
+        g.wda_link_down.observe(Instant::now() - crate::machine::LINK_DOWN_RESTART, true);
+        let c = check(&mut g);
+        let health = c.probe().await;
+        d.apply_health(&mut g, c, health).await;
+        assert!(g.runner.is_none() && g.wda.is_none(), "sustained link failure restarts WDA");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 连得上但答得不对：照旧要 3 次、跨 60 秒才重启
+    #[tokio::test]
+    async fn response_failures_need_the_confirmation_window() {
+        let (d, dir) = testkit::daemon("misses");
+        let fake = testkit::healthy_wda();
+        fake.on("GET", "/status", Reply::timeout());
+        let mut g = d.inner.lock().await;
+        prepare(&mut g, &fake);
+        g.state = DeviceState::Ready;
+        for _ in 0..3 {
+            let c = check(&mut g);
+            let health = c.probe().await;
+            d.apply_health(&mut g, c, health).await;
+        }
+        assert!(g.runner.is_some(), "three quick misses can't kill a live runner");
+        assert_eq!(g.wda_misses.count(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn finished(outcome: StartOutcome) -> tokio::task::JoinHandle<StartOutcome> {
+        let h = tokio::task::spawn_local(async move { outcome });
+        while !h.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        h
+    }
+
+    /// 后台启动 WDA 的结果由巡检收：锁屏 → NeedsUnlock（固定间隔重试），等自动化密码 → NeedsAutomationPin，
+    /// 挂镜像连续失败 3 次清缓存计数
+    #[tokio::test]
+    async fn poll_start_moves_the_state_machine() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (d, dir) = testkit::daemon("poll-start");
+                let mut g = d.inner.lock().await;
+                g.state = DeviceState::WdaStarting { last_error: None };
+                g.starting = Some(finished(StartOutcome::NeedsUnlock).await);
+                d.poll_start(&mut g).await;
+                assert_eq!(g.state, DeviceState::NeedsUnlock);
+                assert!(g.starting.is_none());
+                assert!(!g.backoff.ready(Instant::now()));
+                assert!(g.backoff.ready(Instant::now() + crate::machine::UNLOCK_RETRY));
+
+                g.starting = Some(finished(StartOutcome::Wda(WdaError::NeedsAutomationPin)).await);
+                d.poll_start(&mut g).await;
+                assert_eq!(g.state, DeviceState::NeedsAutomationPin);
+                assert!(g.dedup.was_sent("pin"));
+
+                for n in 1..=3 {
+                    g.starting =
+                        Some(finished(StartOutcome::Ddi { error: "mount failed".into(), mount_failed: true }).await);
+                    d.poll_start(&mut g).await;
+                    assert_eq!(g.ddi_failures, n % 3);
+                }
+                assert!(
+                    matches!(&g.state, DeviceState::WdaStarting { last_error: Some(e) } if e.contains("mount failed"))
+                );
+                // 还没做完的不收
+                g.starting = Some(tokio::task::spawn_local(std::future::pending()));
+                d.poll_start(&mut g).await;
+                assert!(g.starting.is_some());
+                g.starting.take().unwrap().abort();
+                drop(g);
+                std::fs::remove_dir_all(dir).unwrap();
+            })
+            .await;
+    }
+
+    /// 正在重签时有强制重签在等：不取走标记（否则这次只会返回「正在重签」，标记就丢了）
+    #[tokio::test]
+    async fn pending_forced_resign_survives_a_resign_in_progress() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (d, dir) = testkit::daemon("resign-force");
+                let mut g = d.inner.lock().await;
+                g.device = Some(Device::from_usb(&usb()));
+                g.persisted.wda_bundle = Some("b".into());
+                g.resigning = true;
+                g.resign_force_pending = true;
+                g.next_resign = Instant::now();
+                d.schedule_background(&mut g);
+                assert!(g.resign_force_pending);
+                assert!(g.next_resign <= Instant::now(), "retried on the next tick");
+                drop(g);
+                std::fs::remove_dir_all(dir).unwrap();
+            })
+            .await;
+    }
 }
 
 #[cfg(test)]

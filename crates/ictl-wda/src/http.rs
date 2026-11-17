@@ -156,6 +156,9 @@ impl DeviceTransport {
 /// 连上之后的超时是「请求已发出、手机可能还在执行」，不能退到 HID 重做一遍
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 响应（含头部）的大小上限
+const MAX_RESPONSE: usize = 32 * 1024 * 1024;
+
 /// 请求已经整个发出、之后读响应出错的 kind：WDA 可能已经执行了这个操作
 pub const AFTER_SENT: std::io::ErrorKind = std::io::ErrorKind::ConnectionAborted;
 
@@ -360,6 +363,11 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
         if head.is_none() {
             head = parse_head(&buffer);
             if let Some((split, framing)) = head {
+                // 正文定长时一次分配够（截图约 11MB，按 64KB 一块地追加会反复扩容、复制）；声明的长度超过上限的不信
+                if let Framing::Length(n) = framing {
+                    let want = split.saturating_add(n).min(MAX_RESPONSE);
+                    buffer.reserve(want.saturating_sub(buffer.len()));
+                }
                 trace.header_bytes = split;
                 tracing::info!(event = "http_headers", header_bytes = split, framing = ?framing);
                 trace.phase("http_body_read");
@@ -381,7 +389,7 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
         if n == 0 {
             break;
         }
-        if buffer.len() + n > 32 * 1024 * 1024 {
+        if buffer.len() + n > MAX_RESPONSE {
             return Err(after_sent(std::io::Error::other("WDA response too large")));
         }
         buffer.extend_from_slice(&chunk[..n]);
@@ -389,7 +397,7 @@ async fn exchange<S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized>(
     let reusable = head.is_some_and(|(split, framing)| {
         let headers = String::from_utf8_lossy(&buffer[..split]).to_ascii_lowercase();
         let exact = match framing {
-            Framing::Length(n) => buffer.len() == split + n,
+            Framing::Length(n) => split.checked_add(n) == Some(buffer.len()),
             Framing::Chunked => framing.complete(&buffer[split..]),
             Framing::UntilEof => false,
         };
@@ -859,6 +867,32 @@ mod tests {
         assert_eq!(provider.connects.load(Ordering::SeqCst), 2);
         next.await.unwrap();
         server.await.unwrap();
+    }
+
+    /// 有 Content-Length 时按它预先分配；声明得离谱的不照着分配
+    #[tokio::test]
+    async fn response_buffer_is_preallocated_from_content_length_with_a_cap() {
+        for (declared, body) in [(200_000usize, vec![b'x'; 200_000]), (usize::MAX, b"{}".to_vec())] {
+            let (mut client, mut server) = tokio::io::duplex(1 << 20);
+            let writer = tokio::spawn(async move {
+                let mut req = vec![0u8; 4];
+                server.read_exact(&mut req).await.unwrap();
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n");
+                server.write_all(head.as_bytes()).await.unwrap();
+                server.write_all(&body).await.unwrap();
+                drop(server);
+            });
+            let mut stage = "";
+            let mut trace = HttpTrace::new(4);
+            let result = exchange(&mut client, b"GET ", &mut stage, &mut trace).await;
+            writer.await.unwrap();
+            if declared == 200_000 {
+                assert_eq!(result.unwrap().1.len(), 200_000);
+            } else {
+                // 正文比声明的短：连接提前断了（照常报错），但没有按声明的长度分配内存
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]

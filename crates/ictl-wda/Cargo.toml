@@ -9,6 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 description = "WDA：启动 XCTest runner、HTTP 客户端、元素树解析"
 
+[features]
+# 单测用的假 WDA（`ictl_wda::fake`），给依赖它的 crate 的单测用；正式构建不开
+test-util = []
+
 [dependencies]
 ictl-l10n.workspace = true
 ictl-device.workspace = true

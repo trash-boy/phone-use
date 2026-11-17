@@ -51,7 +51,8 @@
 
 - 全部跑在一个 `LocalSet` 里（单线程协作）；设备相关状态（隧道、HID 会话、runner、WDA 客户端）在一把锁后面。
 - 每个连接一个任务，请求在任务里等锁；主循环本身从不阻塞。
-- 10 秒巡检用 `try_lock`：有请求在用设备就跳过这一轮，不排队。
+- 10 秒巡检用 `try_lock`：有请求在用设备就跳过这一轮，不排队。巡检持锁只做改状态的部分：列设备、WDA `/status` 探测（走单独的连接）在锁外做，回来时 WDA 客户端换过（代数变了）就不用这次结果；从不持锁睡眠。就绪后不再每轮查配对记录；HID 用的 WDA 旋转角快过期时才重读。
+- 请求里碰到 WDA 连不上（`Unavailable`），之后 5 秒内同一请求和紧接着的请求不再碰 WDA，直接走 HID 后备（每次连不上最长要等 10 秒建连接）；HID 触摸前核对横竖时，2 秒内截过的 HID 图的宽高直接用。超时、中途断开照旧不退到 HID。
 - 耗时的事不持锁：
   - 启动 WDA（单独开一条隧道查/挂开发者镜像，再启动 runner，最长约 2 分钟）是后台任务，巡检收结果；期间工具调用照常走 HID 后备路线。
   - 重签分三段：持锁取参数 → 不持锁签名、安装 → 持锁写结果。
@@ -76,7 +77,7 @@
   WDA 签名安装过？ ──────────── 否 ─▶ NeedsSigning（iphone-control sign）
         │ 是
   本进程 runner 存活且 /status ready？ ── 是 ─▶ Ready
-        │ 否（runner 还活着时连续 3 次才算）→ 丢掉 runner、WDA 客户端、隧道
+        │ 否（runner 还活着时：连得上但答得不对要连续 3 次、跨 60 秒；连不上持续 150 秒）→ 丢掉 runner、WDA 客户端、隧道
         ▼
   WdaStarting：后台任务 开隧道 → 查/挂开发者镜像 → 关隧道 → 启动 runner（最长 120 秒）
         │ 结果由下一轮巡检收
@@ -102,7 +103,7 @@
 |---|---|---|
 | `ictl-device` | `Device` 句柄：usbmux 发现与监听、lockdown、配对状态、开发者模式状态、隧道（`Tunnel`，持有 HID 会话和显示媒体流）、开发者镜像（含下载缓存）、截图、App 列表/启动/结束、安装 IPA；所有设备调用都有时限 | `idevice`（锁上游 git 提交） |
 | `ictl-wda` | `WdaRunner`（XCUITestService 启动/停止）、`WdaClient`（会话、点击、W3C actions、keys、source、screenshot、appium settings、锁屏核对）、经 usbmuxd 直连设备 8100 端口的 HTTP 传输（区分连不上和请求超时）、元素树解析（纯函数，可单测） | `idevice`（`xctest`）、`quick-xml` |
-| `ictl-protocol` | 控制接口的 `Request`/`Response` 类型和客户端 `call(socket, req, timeout)` | `serde`、`tokio` |
+| `ictl-protocol` | 控制接口的 `Request`/`Response` 类型和客户端 `call(socket, req, timeout)`；工具参数到请求的转换和检查 `tool_to_request`（MCP、网关共用，网关用严格口径）；组合请求 `Request::Then`（操作 + 等稳定 + 看界面，守护进程一次持锁做完） | `serde`、`tokio` |
 | `ictl-sign` | Apple ID 登录（含双重认证交互）、会话持久化、注册设备、App ID、描述文件、签名 `.app`/`.ipa`（**包括 `.xctest`**；bundle 逻辑改写自 plume_utils）、签后自检 | vendored 的 `plume_core`/`plume_store`（MPL-2.0/MIT；经 plume_core 用 vendored 的 `omnisette` 和打过补丁的 `apple-codesign`） |
 | `ictl-unlock` | 锁屏密码键盘定位、逐位输入并核对密码栏、从第 2 位起先写停用标记 | `ictl-wda` |
 | `ictl-daemon` | `core`（共享状态、请求分发、快照）、`supervise`（巡检、usbmuxd 看护、后台启动 WDA、重签、会话检查）、`tools`（工具的实现、HID 后备）、`devices`（列出、选择设备）、`doctor`；通知（Bark/Telegram）、截图缩放/裁剪、控制接口服务端 | 以上全部、`tokio`、`reqwest`、`image` |

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod tools;
+pub use tools::{ArgPolicy, ToolArgError, tool_to_request};
+
 /// 以 root 运行（容器、系统服务）时的控制接口和数据目录
 pub const SYSTEM_SOCKET: &str = "/run/iphone-control/ctl.sock";
 pub const SYSTEM_DATA_DIR: &str = "/var/lib/iphone-control";
@@ -132,6 +135,29 @@ pub enum Request {
     SelectDevice {
         device: String,
     },
+    /// 组合请求：先做 `action`（一个操作类请求，可以没有），再按 `then` 等界面稳定、返回操作后的界面，
+    /// 守护进程在同一次持锁里做完（原来要 3～4 次调用，每次重新连接、重新排队等锁）。
+    /// `action` 出错就只回这个错误，不再看界面。旧版本守护进程不认识它，回「请求格式错误」，什么都没做
+    Then {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<Box<Request>>,
+        then: ThenView,
+    },
+}
+
+/// [`Request::Then`] 做完操作后返回什么
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "view", rename_all = "snake_case")]
+pub enum ThenView {
+    /// 不返回界面；`alert_check` 时（操作的结果里没报过弹窗才）查一下有没有系统弹窗挡着
+    None {
+        #[serde(default)]
+        alert_check: bool,
+    },
+    /// 等界面稳定（最多 `settle_ms`），再列元素（同 [`Request::ListElements`]，复用不超过 `max_age_ms` 的元素树）
+    Elements { filter: String, limit: usize, settle_ms: u64, max_age_ms: u64 },
+    /// 等界面稳定（最多 `settle_ms`），再截图（同 [`Request::Screenshot`]）
+    Screenshot { region: Option<(f64, f64, f64, f64)>, settle_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,6 +179,16 @@ pub enum Response {
     },
     Error {
         message: String,
+    },
+    /// [`Request::Then`] 带截图的结果：操作和等待的说明文字，加截图（同 [`Response::Image`]）
+    TextAndImage {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<Outcome>,
+        jpeg_base64: String,
+        caption: String,
+        #[serde(default, rename = "coordinateMapping", skip_serializing_if = "Option::is_none")]
+        coordinate_mapping: Option<CoordinateMapping>,
     },
 }
 
@@ -191,6 +227,36 @@ impl Response {
 }
 
 impl Request {
+    /// 请求的 `op`（序列化后的标签），不用为了它把整个请求（含输入的文字）序列化一遍
+    pub fn op(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Screenshot { .. } => "screenshot",
+            Self::Observe { .. } => "observe",
+            Self::ListElements { .. } => "list_elements",
+            Self::Tap { .. } => "tap",
+            Self::TapElement { .. } => "tap_element",
+            Self::LongPress { .. } => "long_press",
+            Self::Swipe { .. } => "swipe",
+            Self::TypeText { .. } => "type_text",
+            Self::PressButton { .. } => "press_button",
+            Self::ListApps { .. } => "list_apps",
+            Self::LaunchApp { .. } => "launch_app",
+            Self::TerminateApp { .. } => "terminate_app",
+            Self::OpenUrl { .. } => "open_url",
+            Self::Settle { .. } => "settle",
+            Self::AlertCheck => "alert_check",
+            Self::WaitFor { .. } => "wait_for",
+            Self::Daemon => "daemon",
+            Self::Doctor => "doctor",
+            Self::Resign { .. } => "resign",
+            Self::UnlockReset => "unlock_reset",
+            Self::ListDevices => "list_devices",
+            Self::SelectDevice { .. } => "select_device",
+            Self::Then { .. } => "then",
+        }
+    }
+
     /// Commands that can change the device, including reads that automatically unlock.
     pub fn requires_control(&self) -> bool {
         self.is_device_action()
@@ -202,11 +268,15 @@ impl Request {
                     | Self::WaitFor { .. }
                     | Self::UnlockReset
                     | Self::Resign { .. }
+                    | Self::Then { .. }
             )
     }
 
     /// 会改变手机状态的操作。守护进程忙时排队太久就放弃，免得点击落到已经变了的屏幕上
     pub fn is_device_action(&self) -> bool {
+        if let Self::Then { action, .. } = self {
+            return action.as_ref().is_some_and(|a| a.is_device_action());
+        }
         matches!(
             self,
             Self::Tap { .. }
@@ -404,6 +474,66 @@ mod tests {
         {
             assert!(!req.requires_control());
         }
+    }
+
+    #[test]
+    fn op_matches_the_serialized_tag() {
+        let then = ThenView::Elements { filter: String::new(), limit: 1, settle_ms: 0, max_age_ms: 0 };
+        for req in [
+            Request::Status,
+            Request::Screenshot { region: None },
+            Request::Observe { limit: 0, snapshot_timeout_ms: 0 },
+            Request::ListElements { filter: String::new(), limit: 0, max_age_ms: 0, snapshot_timeout_ms: 0 },
+            Request::Tap { x: 0.0, y: 0.0 },
+            Request::TapElement { text: String::new(), index: 0, max_age_ms: 0 },
+            Request::LongPress { x: 0.0, y: 0.0, seconds: 0.0 },
+            Request::Swipe { from: (0.0, 0.0), to: (0.0, 0.0), seconds: 0.0 },
+            Request::TypeText { text: "secret".into(), submit: false },
+            Request::PressButton { button: String::new() },
+            Request::ListApps { include_system: false },
+            Request::LaunchApp { app: String::new() },
+            Request::TerminateApp { app: String::new() },
+            Request::OpenUrl { url: String::new() },
+            Request::Settle { max_ms: 0 },
+            Request::AlertCheck,
+            Request::WaitFor { text: String::new(), timeout_ms: 0 },
+            Request::Daemon,
+            Request::Doctor,
+            Request::Resign { force: false },
+            Request::UnlockReset,
+            Request::ListDevices,
+            Request::SelectDevice { device: String::new() },
+            Request::Then { action: Some(Box::new(Request::Tap { x: 0.0, y: 0.0 })), then },
+        ] {
+            assert_eq!(serde_json::to_value(&req).unwrap()["op"], req.op(), "{req:?}");
+        }
+    }
+
+    /// 组合请求的线上格式；没有 action 时不带这个键；操作类与否看里面的 action
+    #[test]
+    fn then_requests_round_trip_and_classify_by_their_action() {
+        let req = Request::Then {
+            action: Some(Box::new(Request::Tap { x: 1.0, y: 2.0 })),
+            then: ThenView::Screenshot { region: None, settle_ms: 1500 },
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains(r#""action":{"op":"tap""#) && s.contains(r#""view":"screenshot""#), "{s}");
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), req);
+        assert!(req.is_device_action() && req.requires_control());
+        let bare = Request::Then { action: None, then: ThenView::None { alert_check: true } };
+        let s = serde_json::to_string(&bare).unwrap();
+        assert!(!s.contains("action"), "{s}");
+        assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), bare);
+        assert!(!bare.is_device_action() && bare.requires_control());
+        let both = Response::TextAndImage {
+            text: "t".into(),
+            outcome: None,
+            jpeg_base64: "AAAA".into(),
+            caption: "c".into(),
+            coordinate_mapping: None,
+        };
+        let s = serde_json::to_string(&both).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), both);
     }
 
     #[test]

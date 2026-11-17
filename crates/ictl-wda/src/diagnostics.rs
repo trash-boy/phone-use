@@ -6,6 +6,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// 拿锁；锁被一个 panic 毒化了也照常拿到里面的数据。这里的锁只保护诊断记录、进度这类可以容忍
+/// 写了一半的数据：一次 panic 不能让之后的每次访问（包括 `status`）都跟着 panic
+pub fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn native_start_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -73,7 +79,7 @@ impl RunnerDiagnostics {
         })))
     }
     pub fn snapshot(&self) -> RunnerSnapshot {
-        let s = self.0.lock().unwrap();
+        let s = lock_unpoisoned(&self.0);
         let mut snapshot = s.snapshot.clone();
         if let (Some(observation), Some(at)) = (&mut snapshot.last_process_observation, s.process_time) {
             observation.age_ms = at.elapsed().as_millis() as u64;
@@ -82,19 +88,19 @@ impl RunnerDiagnostics {
         snapshot
     }
     pub fn stop(&self, reason: StopReason) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = lock_unpoisoned(&self.0);
         s.snapshot.stop_reason.get_or_insert(reason);
     }
     pub fn exited(&self, category: &'static str) {
-        self.0.lock().unwrap().snapshot.exit_category = Some(category.into());
+        lock_unpoisoned(&self.0).snapshot.exit_category = Some(category.into());
     }
     pub(crate) fn next_sequence(&self) -> u64 {
-        let mut s = self.0.lock().unwrap();
+        let mut s = lock_unpoisoned(&self.0);
         s.snapshot.event_sequence += 1;
         s.snapshot.event_sequence
     }
     pub fn event(&self, event: &'static str) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = lock_unpoisoned(&self.0);
         s.snapshot.event_sequence += 1;
         let p = &s.snapshot;
         tracing::info!(event, native_pid=p.identity.native_pid, native_start_id=%p.identity.native_start_id, runner_id=p.identity.runner_id, phone_pid=?p.phone_pid, event_seq=p.event_sequence, stop_reason=?p.stop_reason, exit_category=?p.exit_category, process_state=?p.last_process_observation.as_ref().map(|o|o.state.as_str()), process_category=?p.last_process_observation.as_ref().map(|o|o.category.as_str()), process_age_ms=?s.process_time.map(|at|at.elapsed().as_millis() as u64), probe_duration_ms=?p.last_process_observation.as_ref().map(|o|o.duration_ms), monitoring=?p.last_process_observation.as_ref().map(|o|o.monitoring));
@@ -102,7 +108,7 @@ impl RunnerDiagnostics {
 }
 impl ProcessObserver for RunnerDiagnostics {
     fn observe(&self, event: ProcessEvent) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = lock_unpoisoned(&self.0);
         match event {
             ProcessEvent::Launched { pid } => {
                 s.snapshot.phone_pid = Some(pid);
@@ -137,6 +143,22 @@ impl ProcessObserver for RunnerDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一次 panic 毒化了锁之后，诊断记录照样能读写（`status` 不能跟着 panic）
+    #[test]
+    fn poisoned_diagnostics_stay_usable() {
+        let d = RunnerDiagnostics::new(3);
+        let inner = d.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = inner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(d.0.is_poisoned());
+        d.event("after_poison");
+        assert_eq!(d.snapshot().identity.runner_id, 3);
+    }
+
     #[test]
     fn cleanup_then_socket_error_keeps_requested_first_cause() {
         let d = RunnerDiagnostics::new(1);

@@ -7,6 +7,8 @@
 pub mod client;
 pub mod diagnostics;
 pub mod elements;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
 pub mod http;
 mod mjpeg;
 pub mod runner;

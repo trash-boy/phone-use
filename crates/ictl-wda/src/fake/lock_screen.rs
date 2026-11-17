@@ -12,11 +12,11 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ictl_wda::http::Transport;
+use crate::http::Transport;
 use serde_json::{Value, json};
 
-const LOCK_XML: &str = include_str!("../../ictl-wda/tests/fixtures/lockscreen.xml");
-const HOME_XML: &str = include_str!("../../ictl-wda/tests/fixtures/home.xml");
+const LOCK_XML: &str = include_str!("../../tests/fixtures/lockscreen.xml");
+const HOME_XML: &str = include_str!("../../tests/fixtures/home.xml");
 /// 与 lockscreen.xml 里各键的中心点一致
 const KEYS: [(i64, i64); 10] = [
     (215, 695),
@@ -33,13 +33,13 @@ const KEYS: [(i64, i64); 10] = [
 /// lockscreen.xml 里右下角按钮（有输入时是「删除」）的中心
 const DELETE: (i64, i64) = (327, 857);
 
-const IPAD_TOUCHID_XML: &str = include_str!("../../ictl-wda/tests/fixtures/ipad-touchid-landscape.xml");
-const IPAD_PIN_XML: &str = include_str!("../../ictl-wda/tests/fixtures/ipad-passcode-landscape.xml");
+const IPAD_TOUCHID_XML: &str = include_str!("../../tests/fixtures/ipad-touchid-landscape.xml");
+const IPAD_PIN_XML: &str = include_str!("../../tests/fixtures/ipad-passcode-landscape.xml");
 /// Home 键在左的横屏：树里的坐标和上面中心对称，换算到屏幕上键位不变
-const IPAD_TOUCHID_LEFT_XML: &str = include_str!("../../ictl-wda/tests/fixtures/ipad-touchid-landscape-home-left.xml");
+const IPAD_TOUCHID_LEFT_XML: &str = include_str!("../../tests/fixtures/ipad-touchid-landscape-home-left.xml");
 /// iPad 竖屏锁屏（上滑之前）。去掉「按下主屏幕按钮以解锁」那行就是熄屏、有通知时的样子：认不出是锁屏
-const IPAD_LOCK_XML: &str = include_str!("../../ictl-wda/tests/fixtures/ipad-lockscreen-portrait.xml");
-const IPAD_PIN_LEFT_XML: &str = include_str!("../../ictl-wda/tests/fixtures/ipad-passcode-landscape-home-left.xml");
+const IPAD_LOCK_XML: &str = include_str!("../../tests/fixtures/ipad-lockscreen-portrait.xml");
+const IPAD_PIN_LEFT_XML: &str = include_str!("../../tests/fixtures/ipad-passcode-landscape-home-left.xml");
 /// ipad-passcode-landscape.xml 里各键按 Home 键在右的横屏换算到屏幕上的中心点（真机截图对得上）
 const IPAD_KEYS: [(i64, i64); 10] = [
     (512, 586),
@@ -81,6 +81,8 @@ pub struct State {
     /// XCTest 的 home 点不亮屏幕
     xctest_home_dead: bool,
     pub hid_events: u32,
+    /// 连不上 WDA（端口不通）：每个请求都报连不上，[`crate::WdaClient`] 把它当作 [`crate::WdaError::Unavailable`]
+    pub unreachable: bool,
     /// iPad 模式：点过「使用密码」，键盘出来了
     pub passcode_requested: bool,
     /// iPad 模式：点在键和按钮以外的次数
@@ -168,6 +170,11 @@ impl FakeLockScreen {
         let mut s = self.st.lock().unwrap();
         s.asleep = true;
         s.xctest_home_dead = xctest_home_dead;
+    }
+
+    /// 之后的请求都连不上（`true`）或恢复（`false`）
+    pub fn set_unreachable(&self, v: bool) {
+        self.st.lock().unwrap().unreachable = v;
     }
 
     pub fn broken_after_press(&self, n: u32) {
@@ -324,6 +331,9 @@ impl Transport for &FakeLockScreen {
         body: Option<Vec<u8>>,
         _: Duration,
     ) -> std::io::Result<(u16, Vec<u8>)> {
+        if self.st.lock().unwrap().unreachable {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "fake WDA unreachable"));
+        }
         let body = body.and_then(|b| serde_json::from_slice(&b).ok());
         let (status, v) = self.handle(method, path, body);
         Ok((status, v.to_string().into_bytes()))

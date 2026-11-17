@@ -1,7 +1,7 @@
 //! 锁屏自动解锁（默认关闭，需显式配置密码文件）。
 //!
 //! 规则来自 toolkit 实测，之后按 iOS 26/27 的 iPhone、iPad 真机补充（以下是现行规则）：
-//! 1. 先读 `/wda/locked`，没锁直接返回；WDA 不可用也直接返回（交给后面的调用去报错）
+//! 1. 先读 `/wda/locked`，没锁直接返回；WDA 不可用也直接返回 [`Outcome::Unknown`]（不知道锁没锁，交给后面的调用去报错或退到 HID）
 //! 2. 每轮固定：按 Home → 等 1.0s → 底部上滑 → 等 1.5s。不以「树里有键盘」判断：键盘收起时按键元素也常驻树中。
 //!    有 Touch ID 的机型上滑后是「触控 ID」提示，先点「使用密码」再等 1.5s 调出键盘。
 //!    数字键的位置排不成电话键盘（坐标换算错了）就当没有键盘，一位都不按
@@ -84,9 +84,18 @@ pub struct UnlockConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 本来就没锁，或 WDA 不可用（不处理）
+    /// 确认本来就没锁
     NotLocked,
     Unlocked,
+    /// WDA 连不上，不知道锁没锁（什么都没做）。调用方不能把它当成「确认没锁」记下来
+    Unknown,
+}
+
+impl Outcome {
+    /// 确认过手机现在没锁屏（本来没锁或刚解开）
+    pub fn confirmed_unlocked(self) -> bool {
+        matches!(self, Self::NotLocked | Self::Unlocked)
+    }
 }
 
 impl UnlockConfig {
@@ -104,7 +113,7 @@ pub async fn ensure_unlocked<T: Transport>(wda: &mut WdaClient<T>, cfg: &UnlockC
     // 先只问 WDA：确定没锁就直接返回，日常操作不多发请求
     let reported = match wda.wda_reports_locked().await {
         Ok(v) => v,
-        Err(WdaError::Unavailable(_)) => return Ok(Outcome::NotLocked),
+        Err(WdaError::Unavailable(_)) => return Ok(Outcome::Unknown),
         Err(e) => return Err(e.into()),
     };
     if !reported && wda.lock_state_trusted() {
@@ -119,7 +128,7 @@ pub async fn ensure_unlocked<T: Transport>(wda: &mut WdaClient<T>, cfg: &UnlockC
         match wda.check_lock(Some(reported), false).await {
             Ok(c) if !(c.locked || c.uncertain && code.is_ok()) => return Ok(Outcome::NotLocked),
             Ok(_) => {}
-            Err(WdaError::Unavailable(_)) => return Ok(Outcome::NotLocked),
+            Err(WdaError::Unavailable(_)) => return Ok(Outcome::Unknown),
             Err(e) => return Err(e.into()),
         }
     }
@@ -369,12 +378,9 @@ async fn enter_rest<T: Transport>(
 }
 
 #[cfg(test)]
-mod fake;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use fake::FakeLockScreen;
+    use ictl_wda::fake::FakeLockScreen;
 
     fn cfg(passcode: Option<&str>) -> (UnlockConfig, PathBuf) {
         let dir = std::env::temp_dir().join(format!("ictl-unlock-{}", uuid::Uuid::new_v4()));
@@ -416,6 +422,22 @@ mod tests {
         assert_eq!(ensure_unlocked(&mut WdaClient::new(&fake), &cfg).await.unwrap(), Outcome::NotLocked);
         assert_eq!(fake.state().requests_to_actions, 0);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// WDA 连不上时不知道锁没锁：报 Unknown，不能当成确认没锁（守护进程会据此在 20 秒内跳过锁屏检查）
+    #[tokio::test]
+    async fn unreachable_wda_is_unknown_not_unlocked() {
+        let fake = FakeLockScreen::new("123456");
+        fake.set_unreachable(true);
+        for code in [Some("123456"), None] {
+            let (cfg, dir) = cfg(code);
+            let outcome = ensure_unlocked(&mut WdaClient::new(&fake), &cfg).await.unwrap();
+            assert_eq!(outcome, Outcome::Unknown);
+            assert!(!outcome.confirmed_unlocked());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        assert_eq!(fake.state().requests_to_actions, 0);
+        assert!(Outcome::NotLocked.confirmed_unlocked() && Outcome::Unlocked.confirmed_unlocked());
     }
 
     #[tokio::test]
