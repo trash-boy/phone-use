@@ -24,6 +24,17 @@ const ORIENTATION_REUSE: Duration = Duration::from_millis(1500);
 /// 这个时限只兜底同为横屏的左右翻转。真机任务（2026-11-13）：一步常超过 15 秒，58 步问了 31 次，
 /// 慢链路上每次平均 3.2 秒、最长 9 秒（WDA 要等界面静止才回答）
 const FRAME_ORIENTATION_REUSE: Duration = Duration::from_secs(120);
+/// `/source` 的默认时限：完整树要 7～8 秒，排除慢属性后约 0.3 秒；页面加载中可能更久
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 有界截图策略下要原始分辨率截图（区域放大）时的说明
+pub const FULL_RESOLUTION_UNSUPPORTED: &str =
+    "region zoom needs a full-resolution screenshot, which the bounded remote capture policy does not allow";
+
+fn bounded_unsupported() -> WdaError {
+    tracing::warn!(event = "capture_rejected", category = "mjpeg_unsupported");
+    WdaError::Unavailable("bounded MJPEG capture is unsupported".into())
+}
+
 /// 普通点击按下的时长（毫秒）。太短可能不被识别成点击；解锁按键另有自己的时长
 const TAP_PRESS_MS: u64 = 50;
 
@@ -133,6 +144,8 @@ pub struct WdaClient<T> {
     low_latency: bool,
     bounded_capture: bool,
     profile_applied: bool,
+    /// 判断画面动没动时 MJPEG 读不到（传输不支持或读失败过），之后都用普通截图
+    mjpeg_motion_broken: bool,
 }
 
 impl<T: Transport> WdaClient<T> {
@@ -148,6 +161,7 @@ impl<T: Transport> WdaClient<T> {
             low_latency: false,
             bounded_capture: false,
             profile_applied: false,
+            mjpeg_motion_broken: false,
         }
     }
     /// Dedicated browser-control session. Ordinary MCP clients retain their defaults.
@@ -441,47 +455,107 @@ impl<T: Transport> WdaClient<T> {
 
     /// Encoded screenshot bytes. The legacy method name is retained; low-latency sessions may return JPEG.
     pub async fn screenshot_png(&mut self) -> Result<Vec<u8>> {
-        if self.low_latency || self.bounded_capture {
+        if self.mjpeg_capture() {
             self.session_id().await?;
         }
         self.capture_encoded().await
     }
 
-    /// A screenshot and the element-tree XML, read concurrently. The MJPEG frame has its
-    /// own connection, so the `/source` round trip overlaps the capture instead of
-    /// following it. `/source` is bounded by `source_budget`; the capture keeps its own limits.
+    /// 原始分辨率的截图（`/screenshot`，PNG），不用缩小、压缩过的 MJPEG 帧。区域放大要从原始像素裁剪
+    /// （docs/architecture.md §5）；只许用 MJPEG 的有界截图策略下不支持，报错而不是给一张糊的图
+    pub async fn screenshot_full_resolution(&mut self) -> Result<Vec<u8>> {
+        if self.bounded_capture {
+            tracing::warn!(event = "capture_rejected", category = "full_resolution_forbidden");
+            return Err(WdaError::Unavailable(FULL_RESOLUTION_UNSUPPORTED.into()));
+        }
+        if self.low_latency {
+            self.session_id().await?;
+        }
+        self.png_screenshot().await
+    }
+
+    /// 判断画面动没动用的一帧：能用 MJPEG（9100 端口，和控制连接互不影响）就用它，
+    /// 比整张 PNG 小得多、解码也快；不支持或读失败一次后就一直用普通截图
+    pub async fn motion_frame(&mut self) -> Result<Vec<u8>> {
+        if self.mjpeg_capture() {
+            return self.screenshot_png().await;
+        }
+        if !self.mjpeg_motion_broken {
+            match self.transport.screenshot_jpeg().await {
+                Ok(Some(jpeg)) => return Ok(jpeg),
+                Ok(None) => self.mjpeg_motion_broken = true,
+                Err(e) => {
+                    tracing::info!(event = "mjpeg_motion_unavailable", error = %e);
+                    self.mjpeg_motion_broken = true;
+                }
+            }
+        }
+        self.png_screenshot().await
+    }
+
+    /// 截图和元素树 XML。`/source` 最多等 `source_budget`，截图有它自己的时限。
+    /// - MJPEG 截图走自己的连接（9100 端口），和 `/source` 真正并行
+    /// - 否则两者共用一条控制连接（请求排队），并行只会让 `/source` 排在约 11MB 的截图后面白白耗掉预算：
+    ///   先截图，截完再开始算 `/source` 的预算
     pub async fn screenshot_with_source(&mut self, source_budget: Duration) -> (Result<Vec<u8>>, Result<String>) {
-        if (self.low_latency || self.bounded_capture)
-            && let Err(error) = self.session_id().await
-        {
+        if !self.mjpeg_capture() {
+            let frame = self.png_screenshot().await;
+            return (frame, self.source_within(source_budget).await);
+        }
+        if let Err(error) = self.session_id().await {
             let source = Err(WdaError::Unavailable(error.to_string()));
             return (Err(error), source);
         }
-        let source = async {
-            tokio::time::timeout(source_budget, self.source_xml())
-                .await
-                .unwrap_or_else(|_| Err(WdaError::Timeout("UI element snapshot budget exceeded".into())))
+        let (jpeg, source) = tokio::join!(self.mjpeg_frame(), self.source_within(source_budget));
+        let frame = match jpeg {
+            Ok(Some(jpeg)) => Ok(jpeg),
+            // 传输不支持 MJPEG：`/source` 已经读完，再走普通截图，不和它抢连接
+            Ok(None) if !self.bounded_capture => self.png_screenshot().await,
+            Ok(None) => Err(bounded_unsupported()),
+            Err(e) => Err(e),
         };
-        tokio::join!(self.capture_encoded(), source)
+        (frame, source)
+    }
+
+    /// 截图走 MJPEG（低延迟、有界截图）
+    fn mjpeg_capture(&self) -> bool {
+        self.low_latency || self.bounded_capture
+    }
+
+    /// `/source`，HTTP 请求本身的时限就是 `budget`（超时的请求连同连接一起丢掉，不留在连接池里）
+    async fn source_within(&self, budget: Duration) -> Result<String> {
+        self.source_xml_timeout(budget).await.map_err(|e| match e {
+            WdaError::Timeout(_) => WdaError::Timeout("UI element snapshot budget exceeded".into()),
+            other => other,
+        })
+    }
+
+    /// One MJPEG frame; `None` when the transport has no MJPEG support. A failed read is an error and
+    /// must not trigger a multi-megabyte PNG fallback.
+    async fn mjpeg_frame(&self) -> Result<Option<Vec<u8>>> {
+        self.transport.screenshot_jpeg().await.map_err(|error| {
+            tracing::warn!(event = "capture_rejected", category = "mjpeg_failed");
+            WdaError::Unavailable(format!("MJPEG capture failed: {error}"))
+        })
     }
 
     /// Encoded screenshot bytes; requires an existing session for MJPEG capture.
     async fn capture_encoded(&self) -> Result<Vec<u8>> {
-        if self.low_latency || self.bounded_capture {
+        if self.mjpeg_capture() {
             // WDA 16.15.3 converts /screenshot back to PNG even when the source
             // quality is JPEG. Capture one MJPEG frame before the WAN instead.
-            // A failed read must not trigger a multi-megabyte PNG fallback.
-            if let Some(jpeg) = self.transport.screenshot_jpeg().await.map_err(|error| {
-                tracing::warn!(event = "capture_rejected", category = "mjpeg_failed");
-                WdaError::Unavailable(format!("MJPEG capture failed: {error}"))
-            })? {
+            if let Some(jpeg) = self.mjpeg_frame().await? {
                 return Ok(jpeg);
             }
             if self.bounded_capture {
-                tracing::warn!(event = "capture_rejected", category = "mjpeg_unsupported");
-                return Err(WdaError::Unavailable("bounded MJPEG capture is unsupported".into()));
+                return Err(bounded_unsupported());
             }
         }
+        self.png_screenshot().await
+    }
+
+    /// `/screenshot`：原始分辨率 PNG
+    async fn png_screenshot(&self) -> Result<Vec<u8>> {
         // base64 约 11MB：从 JSON 里直接拿走字符串，原地去掉换行，不再另外复制
         let Value::String(mut b64) = self.get("/screenshot").await? else {
             return Err(WdaError::Unavailable(
@@ -505,8 +579,13 @@ impl<T: Transport> WdaClient<T> {
 
     /// 元素树 XML，排除可见性等慢属性（完整树 7～8 秒，排除后约 0.3 秒）
     pub async fn source_xml(&self) -> Result<String> {
+        self.source_xml_timeout(SOURCE_TIMEOUT).await
+    }
+
+    /// 同 [`Self::source_xml`]，请求时限由调用方给（轮询时按剩下的预算）
+    pub async fn source_xml_timeout(&self, timeout: Duration) -> Result<String> {
         let path = format!("/source?format=xml&excluded_attributes={}", elements::SOURCE_EXCLUDED);
-        let v = self.call("GET", &path, None, Duration::from_secs(60)).await?;
+        let v = self.call("GET", &path, None, timeout).await?;
         Ok(v["value"].as_str().unwrap_or_default().to_owned())
     }
 
@@ -522,6 +601,11 @@ impl<T: Transport> WdaClient<T> {
     /// Reuse orientation measured for the image in the same locked observation.
     pub async fn tree_in_view(&self, view: elements::View) -> Result<elements::Tree> {
         Ok(elements::parse_tree(&self.source_xml().await?, view))
+    }
+
+    /// 同 [`Self::tree_in_view`]，`/source` 最多等 `timeout`（报 [`WdaError::Timeout`]）
+    pub async fn tree_in_view_within(&self, view: elements::View, timeout: Duration) -> Result<elements::Tree> {
+        Ok(elements::parse_tree(&self.source_xml_timeout(timeout).await?, view))
     }
 
     /// 点击：一个 W3C actions 单指手势（按下 50ms），期间把等待设置临时调小。真机计时（iOS 27）：
@@ -762,8 +846,10 @@ impl<T: Transport> WdaClient<T> {
         Ok(settings)
     }
 
+    /// 改等待设置；已经是这个值就不发请求（同一请求里先后调小、恢复时常常是同一个值）。
+    /// 会话重建、请求出错时 `idle_current` 会清掉，下次照常发
     pub async fn set_idle_settings(&mut self, s: IdleSettings) -> Result<()> {
-        if self.profile_applied && self.idle_current == Some(s) {
+        if self.idle_current == Some(s) {
             return Ok(());
         }
         let body = json!({"settings": {"waitForIdleTimeout": s.wait_for_idle_timeout, "animationCoolOffTimeout": s.animation_cool_off_timeout}});
@@ -1055,6 +1141,105 @@ mod tests {
             "{result:?}"
         );
         assert!(!transport.seen.lock().unwrap().iter().any(|r| r.1 == "/screenshot"));
+    }
+
+    /// 截图和 `/source` 共用一条连接的传输：一次只处理一个请求，时限含排队
+    struct SharedPool {
+        pool: tokio::sync::Mutex<()>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Transport for &SharedPool {
+        async fn send(&self, _: &str, path: &str, _: Option<Vec<u8>>, t: Duration) -> std::io::Result<(u16, Vec<u8>)> {
+            let path = path.to_owned();
+            tokio::time::timeout(t, async {
+                let _busy = self.pool.lock().await;
+                self.seen.lock().unwrap().push(path.clone());
+                if path == "/screenshot" {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return Ok((200, br#"{"value":"cG5n"}"#.to_vec()));
+                }
+                Ok((200, br#"{"value":"<XCUIElementTypeApplication/>"}"#.to_vec()))
+            })
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "slow"))?
+        }
+    }
+
+    /// 没有 MJPEG 时截图和 `/source` 共用连接：`/source` 等截图完了才开始算预算，不会因为排在 PNG 后面超时
+    #[tokio::test(start_paused = true)]
+    async fn without_mjpeg_source_budget_starts_after_the_screenshot() {
+        let t = SharedPool { pool: tokio::sync::Mutex::new(()), seen: Mutex::new(Vec::new()) };
+        let mut client = WdaClient::new(&t);
+        let (frame, source) = client.screenshot_with_source(Duration::from_secs(1)).await;
+        assert_eq!(frame.unwrap(), b"png");
+        assert_eq!(source.unwrap(), "<XCUIElementTypeApplication/>");
+        let seen = t.seen.lock().unwrap();
+        assert_eq!(seen[0], "/screenshot");
+        assert!(seen[1].starts_with("/source?"));
+    }
+
+    /// 区域放大要原始像素：低延迟会话也走 `/screenshot`，不拿 40% 的 MJPEG 帧；有界策略下明确报不支持
+    #[tokio::test]
+    async fn region_capture_uses_full_resolution_png_or_refuses_under_bounded_policy() {
+        let transport = JpegTransport {
+            http: Mock::with(&[
+                (200, r#"{"sessionId":"A"}"#),
+                (200, r#"{"value":{"screenshotQuality":1,"waitForIdleTimeout":1,"animationCoolOffTimeout":0}}"#),
+                (200, r#"{"value":"cG5n"}"#),
+            ]),
+            fail: false,
+            captures: AtomicU64::new(0),
+        };
+        let mut client = WdaClient::new(&transport).with_low_latency(true);
+        assert_eq!(client.screenshot_full_resolution().await.unwrap(), b"png");
+        assert_eq!(transport.captures.load(Ordering::Relaxed), 0);
+        assert_eq!(transport.http.seen.lock().unwrap()[2].1, "/screenshot");
+
+        let m = Mock::with(&[]);
+        let mut bounded = WdaClient::new(&m).with_bounded_capture(true);
+        let error = bounded.screenshot_full_resolution().await.unwrap_err();
+        assert!(error.to_string().contains("bounded remote capture policy"), "{error}");
+        assert!(m.seen.lock().unwrap().is_empty());
+    }
+
+    /// 判断画面动没动优先用 MJPEG 帧；读不到一次就一直用普通截图
+    #[tokio::test]
+    async fn motion_frames_prefer_mjpeg_and_fall_back_once_it_fails() {
+        let ok = JpegTransport { http: Mock::with(&[]), fail: false, captures: AtomicU64::new(0) };
+        let mut client = WdaClient::new(&ok);
+        assert_eq!(client.motion_frame().await.unwrap(), [255, 216, 255, 217]);
+        assert_eq!(client.motion_frame().await.unwrap(), [255, 216, 255, 217]);
+        assert!(ok.http.seen.lock().unwrap().is_empty());
+
+        let failing = JpegTransport {
+            http: Mock::with(&[(200, r#"{"value":"cG5n"}"#), (200, r#"{"value":"cG5n"}"#)]),
+            fail: true,
+            captures: AtomicU64::new(0),
+        };
+        let mut client = WdaClient::new(&failing);
+        assert_eq!(client.motion_frame().await.unwrap(), b"png");
+        assert_eq!(client.motion_frame().await.unwrap(), b"png");
+        assert_eq!(failing.captures.load(Ordering::Relaxed), 1);
+    }
+
+    /// 等待设置已经是要设的值就不发请求（不管有没有应用低延迟配置）
+    #[tokio::test]
+    async fn idle_settings_are_not_resent_when_unchanged() {
+        let ok = r#"{"value":null}"#;
+        let m = Mock::with(&[
+            (200, r#"{"sessionId":"A"}"#),
+            (200, r#"{"value":{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}}"#),
+            (200, ok),
+            (200, ok),
+            (200, ok),
+        ]);
+        let mut c = WdaClient::new(&m);
+        c.tap(1.0, 2.0).await.unwrap();
+        // 点完已经恢复成平时的值：结束轮询不用再发
+        c.end_polling().await;
+        c.set_idle_settings(IdleSettings::DEFAULT).await.unwrap();
+        assert_eq!(m.seen.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]
