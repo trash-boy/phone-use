@@ -2,6 +2,11 @@
 // Keep the upstream package pinned; fail closed if its implementation changes.
 // usbmux window/ACK protocol reference (behavior only; no implementation copied):
 // https://github.com/libimobiledevice/usbmuxd/blob/master/src/device.c
+//
+// The patch is one set of exact [original, patched] snippets plus appended
+// helpers, applied to the published chunk whose SHA-256 is pinned below. An
+// already patched file is authenticated by reversing exactly these edits.
+// Files patched by an older layout are refused: reinstall with `npm ci`.
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 
@@ -20,26 +25,50 @@ const path = new URL("dist/index-DJrAlfkC.js", root);
 let source = await readFile(path, "utf8");
 const originalHash =
   "da410b47f3150df18f0dab904d16d22f20f0fd2141d0846c1431d4d921375a20";
-const legacyMarker = "// phone-use: device-install stream lifecycle v1";
-const v2Marker = "// phone-use: device-install stream lifecycle v2";
-const v3Marker = "// phone-use: device-install stream lifecycle v3";
-const v4Marker = "// phone-use: device-install stream lifecycle v4";
-const v5Marker = "// phone-use: device-install stream lifecycle v5";
-const v6Marker = "// phone-use: device-install stream lifecycle v6";
-const marker = "// phone-use: device-install stream lifecycle v7";
-const streamReplacements = [
+const markerPrefix = "// phone-use: device-install stream lifecycle v";
+const marker = markerPrefix + "7";
+
+const replacements = [
+  // Forget a partially read usbmux packet when the device is (re)opened.
   [
-    "  async handleFrame(t) {\n    switch (t.type) {",
-    "  async handleFrame(t) {\n    if (this.closed) return;\n    switch (t.type) {",
+    `async function J(e, t) {
+  const { inEndpoint: n, outEndpoint: r } = F(t), a = new Uint8Array(12), i = new DataView(a.buffer);
+`,
+    `async function J(e, t) {
+  muxReaders.delete(e);
+  const { inEndpoint: n, outEndpoint: r } = F(t), a = new Uint8Array(12), i = new DataView(a.buffer);
+`,
   ],
+  // Register the stream before SYN (cancellation can find it); cap streams per USB session.
   [
-    "  async handleOpenStream(t, n, r) {\n    try {",
-    "  async handleOpenStream(t, n, r) {\n    if (this.closed) return;\n    try {",
+    `}
+async function Q(e, t) {
+  if (e.closed)
+    throw new Error("usbmux session is closed.");
+  let n, r;
+`,
+    `}
+async function Q(e, t, onCreate) {
+  if (e.closed)
+    throw new Error("usbmux session is closed.");
+  if (e.streams.size >= 64) throw new Error("USB stream limit exceeded");
+  let n, r;
+`,
   ],
-  ["async function Q(e, t) {", "async function Q(e, t, onCreate) {"],
+  // A failed open releases its stream. Device writes go through a per-stream,
+  // window-limited queue (queueDeviceWrite) instead of one unbounded write.
   [
-    "  return e.streams.set(g(t, a.sport), a), await w(a, m, new Uint8Array()), await a.opened, a;",
-    `  a.opened.catch(() => {});
+    `  };
+  return e.streams.set(g(t, a.sport), a), await w(a, m, new Uint8Array()), await a.opened, a;
+}
+async function K(e, t) {
+  if (e.session.closed)
+    throw new Error("usbmux session is closed.");
+  await w(e, f, t), e.seq += t.byteLength;
+}
+`,
+    `  };
+  a.opened.catch(() => {});
   e.streams.set(g(t, a.sport), a);
   onCreate?.(a);
   try {
@@ -50,172 +79,238 @@ const streamReplacements = [
   } catch (error) {
     releaseDeviceStream(a);
     throw error;
-  }`,
+  }
+}
+function K(e, t) {
+  return queueDeviceWrite(e, t);
+}
+`,
   ],
+  // Session close releases every stream and notifies the relay. Segments carry an
+  // explicit sequence number and advertise this stream's remaining receive window.
   [
-    '  if (e.session.closed)\n    throw new Error("usbmux session is closed.");',
-    '  if (e.closed || e.session.closed)\n    throw e.error ?? new Error("usbmux stream is closed.");',
+    `function I(e) {
+  e.closed = !0;
+  for (const t of e.streams.values())
+    for (t.error = new Error("usbmux session closed"), t.rejectOpened(t.error); t.waiters.length > 0; )
+      t.waiters.shift()(new Uint8Array());
+  e.streams.clear();
+}
+async function w(e, t, n) {
+  const r = new Uint8Array(20 + n.byteLength), a = new DataView(r.buffer);
+  a.setUint16(0, e.sport), a.setUint16(2, e.dport), a.setUint32(4, e.seq), a.setUint32(8, e.ack), a.setUint8(12, 80), a.setUint8(13, t), a.setUint16(14, 512), r.set(n, 20), await P(e.session, v, r);
+}
+`,
+    `function I(e) {
+  muxReaders.delete(e.device);
+  e.closed = !0;
+  for (const t of [...e.streams.values()])
+    releaseDeviceStream(t, { notify: false, reason: "usbmux session closed" });
+  e.streams.clear();
+  const onClose = e.onClose;
+  e.onClose = undefined;
+  onClose?.();
+}
+async function w(e, t, n, seq = e.seq) {
+  const r = new Uint8Array(20 + n.byteLength), a = new DataView(r.buffer);
+  a.setUint16(0, e.sport), a.setUint16(2, e.dport), a.setUint32(4, seq), a.setUint32(8, e.ack), a.setUint8(12, 80), a.setUint8(13, t), a.setUint16(14, deviceReceiveWindow(e)), r.set(n, 20), await P(e.session, v, r);
+}
+`,
   ],
+  // Bound the serialized USB output queue.
   [
-    "      if (r) {",
-    `      if (!r) {
+    `    throw new Error("usbmux session is closed.");
+  return e.writeChain = e.writeChain.then(async () => {
+`,
+    `    throw new Error("usbmux session is closed.");
+  if ((e.pendingMuxWrites ?? 0) >= 256) {
+    I(e);
+    throw new Error("USB output queue exceeded");
+  }
+  e.pendingMuxWrites = (e.pendingMuxWrites ?? 0) + 1;
+  return e.writeChain = e.writeChain.then(async () => {
+`,
+  ],
+  // A failed physical write closes the USB session; release the queue slot.
+  [
+    `    await U(e.device, e.outEndpoint, r);
+  }), e.writeChain;
+}
+`,
+    `    await U(e.device, e.outEndpoint, r);
+  }).catch(error => {
+    if (!e.closed) I(e);
+    throw error;
+  }).finally(() => { e.pendingMuxWrites -= 1; }), e.writeChain;
+}
+`,
+  ],
+  // Reset late SYN/ACKs for abandoned streams; a device RST releases the stream.
+  [
+    `      const n = ne(t.payload), r = e.streams.get(g(n.sport, n.dport));
+      if (r) {
+        if (n.flags & G) {
+          for (r.error = new Error(\`Device reset stream \${r.dport}\`), r.rejectOpened(r.error); r.waiters.length > 0; )
+            r.waiters.shift()(new Uint8Array());
+          e.streams.delete(g(r.dport, r.sport));
+          continue;
+`,
+    `      const n = ne(t.payload), r = e.streams.get(g(n.sport, n.dport));
+      if (!r) {
         // A cancelled SYN may still receive a late SYN/ACK. Reset it so the
         // phone does not retain a connection the server has already abandoned.
         if (!(n.flags & G)) {
           const reset = { session: e, sport: n.dport, dport: n.sport,
             seq: n.flags & f ? n.ack : 0,
             ack: n.flags & f ? 0 : n.seq + n.payload.byteLength + ((n.flags & (m | 1)) ? 1 : 0) };
-          await w(reset, n.flags & f ? G : G | f, new Uint8Array());
+          void w(reset, n.flags & f ? G : G | f, new Uint8Array()).catch(() => {});
         }
         continue;
       }
-      if (r) {`,
+      if (r) {
+        if (n.flags & G) {
+          releaseDeviceStream(r, { notify: false, reason: "Device reset stream" });
+          continue;
+`,
   ],
+  // Idempotent handshake, peer window tracking, ACKs queued off the receive loop,
+  // and only contiguous data delivered (receiveDeviceData).
   [
-    `          for (r.error = new Error(\`Device reset stream \${r.dport}\`), r.rejectOpened(r.error); r.waiters.length > 0; )
-            r.waiters.shift()(new Uint8Array());
-          e.streams.delete(g(r.dport, r.sport));`,
-    `          releaseDeviceStream(r, { notify: false, reason: "Device reset stream" });`,
-  ],
-  [
-    "        n.payload.byteLength !== 0 && (r.ack = n.seq + n.payload.byteLength, await w(r, f, new Uint8Array()), r.waiters.length > 0 ? r.waiters.shift()(n.payload) : r.queue.push(n.payload));",
-    `        if (n.payload.byteLength) {
-          r.ack = n.seq + n.payload.byteLength;
-          if (!(n.flags & 1)) await w(r, f, new Uint8Array());
-          r.waiters.length ? r.waiters.shift()(n.payload) : r.queue.push(n.payload);
+    `        if ((n.flags & (m | f)) === (m | f)) {
+          r.seq += 1, r.ack = n.seq + 1, await w(r, f, new Uint8Array()), r.resolveOpened();
+          continue;
         }
-        if (n.flags & 1) {
-          r.ack = n.seq + n.payload.byteLength + 1;
-          await w(r, 17, new Uint8Array()); // FIN | ACK; FIN consumes one sequence number.
-          r.seq += 1;
-          releaseDeviceStream(r, { notify: false, discard: false, reason: "Device finished stream" });
-        }`,
-  ],
-  [
-    '      this.closed = !0, this.log("Relay socket closed"), this.frameQueue.finally(() => {',
-    '      this.closed = !0, releaseRelayStreams(this), this.log("Relay socket closed"), this.frameQueue.finally(() => {',
-  ],
-  [
-    "    this.closed = !0, this.socket?.close();",
-    "    this.closed = !0, releaseRelayStreams(this), this.socket?.close();",
-  ],
-  [
-    `        await this.handleOpenStream(
-          t.requestId,
-          t.streamId,
-          y(t.payload).port
-        );`,
-    `        void this.handleOpenStream(
-          t.requestId,
-          t.streamId,
-          y(t.payload).port
-        ).catch(error => this.log("Relay stream open failed", h(error)));`,
-  ],
-  [
-    "        if (!n) throw new Error(`Unknown stream ${t.streamId}`);",
-    "        if (!n || n.closed) break; // Late data after cancellation must not revive a stream.",
-  ],
-  [
-    "      case s.StreamClose:\n        this.streams.delete(t.streamId);",
-    `      case s.StreamClose: {
-        const stream = this.streams.get(t.streamId);
-        this.streams.delete(t.streamId);
-        if (stream) releaseDeviceStream(stream);
-      }`,
-  ],
-  [
-    "      const a = await Q(this.session, r);\n      this.streams.set(n, a), await this.send({",
-    `      const a = await Q(this.session, r, stream => this.streams.set(n, stream));
-      if (this.closed || this.streams.get(n) !== a) return;
-      await this.send({`,
-  ],
-  [
-    "    } catch (a) {\n      this.log(\n        `Open device stream ${n} failed`,",
-    `    } catch (a) {
-      if (this.closed || !this.streams.has(n)) return;
-      this.streams.delete(n);
-      this.log(
-        \`Open device stream \${n} failed\`,`,
-  ],
-  [
-    "        if (this.closed) return;\n        await this.send({\n          type: s.StreamData,",
-    `        if (this.closed || this.streams.get(t) !== n) return;
-        if (!r.byteLength && n.error) throw n.error;
-        await this.send({
-          type: s.StreamData,`,
-  ],
-  [
-    "      this.log(`Device stream ${t} closed`, r instanceof Error ? r.message : String(r)), await this.send({",
-    `      if (this.closed || this.streams.get(t) !== n) return;
-      this.streams.delete(t);
-      releaseDeviceStream(n);
-      this.log(\`Device stream \${t} closed\`, r instanceof Error ? r.message : String(r)), await this.send({`,
-  ],
-];
-
-const framingReplacements = [
-  [
-    "async function J(e, t) {",
-    "async function J(e, t) {\n  muxReaders.delete(e);",
-  ],
-  [
-    "function I(e) {\n  e.closed = !0;",
-    "function I(e) {\n  muxReaders.delete(e.device);\n  e.closed = !0;",
-  ],
-  [
-    "    const r = await H(e, t), a = te(r, n);",
-    "    const r = await readMuxFrame(e, t, n), a = te(r, n);",
-  ],
-  [
-    "  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;",
-    `  if (e.byteLength < 20) throw new Error("Short usbmux TCP header");
-  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;
-  if (n < 20 || n > e.byteLength) throw new Error("Invalid usbmux TCP header length");`,
-  ],
-];
-const flowReplacements = [
-  [
-    `async function K(e, t) {
-  if (e.closed || e.session.closed)
-    throw e.error ?? new Error("usbmux stream is closed.");
-  await w(e, f, t), e.seq += t.byteLength;
-}`,
-    `function K(e, t) {
-  return queueDeviceWrite(e, t);
-}`,
-  ],
-  ["async function w(e, t, n) {", "async function w(e, t, n, seq = e.seq) {"],
-  [
-    "a.setUint32(4, e.seq), a.setUint32(8, e.ack)",
-    "a.setUint32(4, seq), a.setUint32(8, e.ack)",
-  ],
-  [
-    "    flags: t.getUint8(13),",
-    "    flags: t.getUint8(13),\n    window: t.getUint16(14),",
-  ],
-  [
-    `  for (const t of e.streams.values())
-    for (t.error = new Error("usbmux session closed"), t.rejectOpened(t.error); t.waiters.length > 0; )
-      t.waiters.shift()(new Uint8Array());`,
-    `  for (const t of [...e.streams.values()])
-    releaseDeviceStream(t, { notify: false, reason: "usbmux session closed" });`,
-  ],
-  [
-    "          r.seq += 1, r.ack = n.seq + 1, await w(r, f, new Uint8Array()), r.resolveOpened();",
-    `          r.seq += 1;
+        n.payload.byteLength !== 0 && (r.ack = n.seq + n.payload.byteLength, await w(r, f, new Uint8Array()), r.waiters.length > 0 ? r.waiters.shift()(n.payload) : r.queue.push(n.payload));
+      }
+`,
+    `        if ((n.flags & (m | f)) === (m | f)) {
+          if (!r.established) {
+            r.seq = (r.seq + 1) >>> 0;
+            r.ack = (n.seq + 1) >>> 0;
+            r.established = true;
+          }
           updateDeviceWindow(r, n);
-          r.ack = n.seq + 1;
-          await w(r, f, new Uint8Array());
-          r.resolveOpened();`,
+          queueDeviceAck(r);
+          r.resolveOpened();
+          continue;
+        }
+        if (n.flags & f) updateDeviceWindow(r, n);
+        if (n.payload.byteLength || (n.flags & 1)) receiveDeviceData(r, n);
+        else if (n.seq === ((r.ack - 1) >>> 0)) queueDeviceAck(r);
+      }
+`,
+  ],
+  // USB bulk-read boundaries are not usbmux packet boundaries.
+  [
+    `  for (; ; ) {
+    const r = await H(e, t), a = te(r, n);
+    if (!(n === 1 && a.protocol !== R))
+`,
+    `  for (; ; ) {
+    const r = await readMuxFrame(e, t, n), a = te(r, n);
+    if (!(n === 1 && a.protocol !== R))
+`,
+  ],
+  // Validate the TCP header length before slicing.
+  [
+    `function ne(e) {
+  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;
+  return {
+`,
+    `function ne(e) {
+  if (e.byteLength < 20) throw new Error("Short usbmux TCP header");
+  const t = new DataView(e.buffer, e.byteOffset, e.byteLength), n = (t.getUint8(12) >> 4) * 4;
+  if (n < 20 || n > e.byteLength) throw new Error("Invalid usbmux TCP header length");
+  return {
+`,
+  ],
+  // Keep the peer's advertised window.
+  [
+    `    flags: t.getUint8(13),
+    payload: e.slice(n)
+`,
+    `    flags: t.getUint8(13),
+    window: t.getUint16(14),
+    payload: e.slice(n)
+`,
+  ],
+  // A closed USB transport closes the relay.
+  [
+    `    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;
+  }
+`,
+    `    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;
+    n.onClose = () => { this.log("USB transport closed"); this.close(); };
+  }
+`,
+  ],
+  // Never connect over a closed USB transport; release streams when the socket closes.
+  [
+    `  async connect() {
+    const t = new WebSocket(this.webSocketUrl);
+    t.binaryType = "arraybuffer", this.socket = t, t.onclose = () => {
+      this.closed = !0, this.log("Relay socket closed"), this.frameQueue.finally(() => {
+        this.pairRecordWaiter && (this.pairRecordWaiter.reject(new Error("Relay socket closed")), this.pairRecordWaiter = void 0);
+`,
+    `  async connect() {
+    if (this.session.closed) throw new Error("USB transport is closed.");
+    const t = new WebSocket(this.webSocketUrl);
+    t.binaryType = "arraybuffer", this.socket = t, t.onclose = () => {
+      this.closed = !0, releaseRelayStreams(this), this.log("Relay socket closed"), this.frameQueue.finally(() => {
+        this.pairRecordWaiter && (this.pairRecordWaiter.reject(new Error("Relay socket closed")), this.pairRecordWaiter = void 0);
+`,
+  ],
+  // Explicit close releases device streams too.
+  [
+    `  close() {
+    this.closed = !0, this.socket?.close();
+  }
+`,
+    `  close() {
+    this.closed = !0, releaseRelayStreams(this), this.socket?.close();
+  }
+`,
+  ],
+  // Ignore frames after close; open device streams without blocking the frame queue.
+  [
+    `  async handleFrame(t) {
+    switch (t.type) {
+      case s.OpenStream:
+        await this.handleOpenStream(
+          t.requestId,
+`,
+    `  async handleFrame(t) {
+    if (this.closed) return;
+    switch (t.type) {
+      case s.OpenStream:
+        void this.handleOpenStream(
+          t.requestId,
+`,
   ],
   [
-    "        if (n.payload.byteLength) {",
-    "        if (n.flags & f) updateDeviceWindow(r, n);\n        if (n.payload.byteLength) {",
+    `          y(t.payload).port
+        );
+        break;
+`,
+    `          y(t.payload).port
+        ).catch(error => this.log("Relay stream open failed", h(error)));
+        break;
+`,
   ],
+  // Data for cancelled streams is dropped; writes are per stream; StreamClose releases.
   [
-    `        await K(n, t.payload);
-        break;`,
-    `        // Each stream owns its write queue. A zero-window stream must not
+    `        const n = this.streams.get(t.streamId);
+        if (!n) throw new Error(\`Unknown stream \${t.streamId}\`);
+        await K(n, t.payload);
+        break;
+      }
+      case s.StreamClose:
+        this.streams.delete(t.streamId);
+        break;
+`,
+    `        const n = this.streams.get(t.streamId);
+        if (!n || n.closed) break; // Late data after cancellation must not revive a stream.
+        // Each stream owns its write queue. A zero-window stream must not
         // block Ping, cancellation or an unrelated device connection.
         void K(n, t.payload).catch(error => {
           if (this.closed || this.streams.get(t.streamId) !== n) return;
@@ -225,25 +320,141 @@ const flowReplacements = [
           return this.send({ type: s.StreamClose, requestId: 0, streamId: t.streamId,
             payload: l({ reason: h(error) }) });
         }).catch(error => this.log("Relay stream write failed", h(error)));
-        break;`,
+        break;
+      }
+      case s.StreamClose: {
+        const stream = this.streams.get(t.streamId);
+        this.streams.delete(t.streamId);
+        if (stream) releaseDeviceStream(stream);
+      }
+        break;
+`,
+  ],
+  // Heartbeats never wait behind a congested uplink.
+  [
+    `      case s.Ping:
+        await this.send({
+          type: s.Pong,
+`,
+    `      case s.Ping:
+        void this.send({
+          type: s.Pong,
+`,
+  ],
+  [
+    `          payload: new Uint8Array()
+        });
+        break;
+`,
+    `          payload: new Uint8Array()
+        }).catch(error => this.log("Relay heartbeat send failed", h(error)));
+        break;
+`,
+  ],
+  // Stream limit, and the preview cooldown only for an enabled continuous viewer.
+  [
+    `  async handleOpenStream(t, n, r) {
+    try {
+      const a = await Q(this.session, r);
+      this.streams.set(n, a), await this.send({
+        type: s.OpenResult,
+`,
+    `  async handleOpenStream(t, n, r) {
+    if (this.closed) return;
+    if (this.streams.size >= 64) {
+      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
+        payload: l({ ok: false, error: "USB stream limit exceeded" }) });
+      return;
+    }
+    if (r === 9100 && this.continuousPreviewEnabled === true && performance.now() < (this.previewSuspendedUntil ?? 0)) {
+      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
+        payload: l({ ok: false, error: "Preview paused for uplink congestion" }) });
+      return;
+    }
+    try {
+      const a = await Q(this.session, r, stream => this.streams.set(n, stream));
+      if (this.closed || this.streams.get(n) !== a) return;
+      await this.send({
+        type: s.OpenResult,
+`,
+  ],
+  // An open cancelled meanwhile reports nothing.
+  [
+    `    } catch (a) {
+      this.log(
+`,
+    `    } catch (a) {
+      if (this.closed || !this.streams.has(n)) return;
+      this.streams.delete(n);
+      this.log(
+`,
+  ],
+  // Relay read credit is returned once WebSocket accepted the chunk.
+  [
+    `        const r = await X(n);
+        if (this.closed) return;
+        await this.send({
+          type: s.StreamData,
+          requestId: 0,
+          streamId: t,
+          payload: r
+        });
+      }
+    } catch (r) {
+      this.log(\`Device stream \${t} closed\`, r instanceof Error ? r.message : String(r)), await this.send({
+`,
+    `        const r = await X(n);
+        if (this.closed || this.streams.get(t) !== n) return;
+        if (!r.byteLength && n.error) throw n.error;
+        try {
+          await this.send({ type: s.StreamData, requestId: 0, streamId: t, payload: r });
+        } finally {
+          consumeDeviceRead(n, r.byteLength);
+        }
+      }
+    } catch (r) {
+      if (this.closed || this.streams.get(t) !== n) return;
+      this.streams.delete(t);
+      releaseDeviceStream(n);
+      this.log(\`Device stream \${t} closed\`, r instanceof Error ? r.message : String(r)), await this.send({
+`,
+  ],
+  // Bounded, back-pressured relay sends (sendBoundedRelayFrame).
+  [
+    `  }
+  async send(t) {
+    if (!this.closed) {
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        this.closed = !0;
+        return;
+      }
+      this.socket.send(_(t));
+    }
+  }
+}
+`,
+    `  }
+  async send(t) { await sendBoundedRelayFrame(this, t); }
+}
+`,
   ],
 ];
-const v3Replacements = [
-  ...streamReplacements,
-  ...framingReplacements,
-  ...flowReplacements,
-];
 
-const legacyHelpers = `
-${legacyMarker}
+const helpers = `
+// phone-use: device-install stream lifecycle v7
 // Close both bookkeeping layers and wake readers BEFORE any asynchronous USB write.
 // Local cancellation uses RST|ACK so a peer cannot retain an abandoned connection.
 function releaseDeviceStream(stream, { notify = true, discard = true, reason = "Stream closed" } = {}) {
   if (stream.closed) return;
   stream.closed = true;
   stream.error = new Error(reason);
+  wakeDeviceWriters(stream);
   stream.session.streams.delete(g(stream.dport, stream.sport));
-  if (discard) stream.queue.length = 0;
+  if (discard) {
+    stream.queue.length = 0;
+    stream.readRetainedBytes = 0;
+    stream.readDiscarded = true;
+  }
   stream.rejectOpened(stream.error);
   while (stream.waiters.length) stream.waiters.shift()(new Uint8Array());
   if (notify && !stream.session.closed) {
@@ -257,10 +468,7 @@ function releaseRelayStreams(relay) {
   relay.pairRecordWaiter?.reject(new Error("Relay socket closed"));
   relay.pairRecordWaiter = undefined;
 }
-`;
-const v2Helpers =
-  legacyHelpers.replace(legacyMarker, v2Marker) +
-  `
+
 // USB bulk-read boundaries are not usbmux packet boundaries. Retain partial
 // headers/bodies and surplus packets, bounded by the 64 KiB usbmux receive limit.
 const muxReaders = new WeakMap();
@@ -290,15 +498,7 @@ async function readMuxFrame(device, endpoint, version) {
     reader.buffer = combined;
   }
 }
-`;
-const v3Helpers =
-  v2Helpers
-    .replace(v2Marker, v3Marker)
-    .replace(
-      "  stream.error = new Error(reason);",
-      "  stream.error = new Error(reason);\n  wakeDeviceWriters(stream);",
-    ) +
-  `
+
 // usbmux's TCP window is scaled by 256 (unlike ordinary unnegotiated TCP).
 // Peer ACK/window credit is local USB flow control, separate from tunneled jktcp.
 function seqAtOrBefore(a, b) { return ((b - a) >>> 0) < 0x80000000; }
@@ -344,130 +544,44 @@ function queueDeviceWrite(stream, bytes) {
   stream.deviceWriteChain = pending;
   return pending.finally(() => { stream.queuedWriteBytes -= data.byteLength; });
 }
-`;
 
-const recoveryReplacements = [
-  [
-    "  e.streams.clear();\n}",
-    "  e.streams.clear();\n  const onClose = e.onClose;\n  e.onClose = undefined;\n  onClose?.();\n}",
-  ],
-  [
-    "    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;",
-    `    this.webSocketUrl = t, this.session = n, this.deviceHello = r, this.log = a;
-    n.onClose = () => { this.log("USB transport closed"); this.close(); };`,
-  ],
-  [
-    "  async connect() {\n    const t = new WebSocket(this.webSocketUrl);",
-    `  async connect() {
-    if (this.session.closed) throw new Error("USB transport is closed.");
-    const t = new WebSocket(this.webSocketUrl);`,
-  ],
-  [
-    "    await U(e.device, e.outEndpoint, r);\n  }), e.writeChain;",
-    `    await U(e.device, e.outEndpoint, r);
-  }).catch(error => {
-    if (!e.closed) I(e);
-    throw error;
-  }), e.writeChain;`,
-  ],
-  [
-    `          r.seq += 1;
-          updateDeviceWindow(r, n);
-          r.ack = n.seq + 1;
-          await w(r, f, new Uint8Array());
-          r.resolveOpened();`,
-    `          if (!r.established) {
-            r.seq = (r.seq + 1) >>> 0;
-            r.ack = (n.seq + 1) >>> 0;
-            r.established = true;
-          }
-          updateDeviceWindow(r, n);
-          await w(r, f, new Uint8Array());
-          r.resolveOpened();`,
-  ],
-  [
-    `        if (n.payload.byteLength) {
-          r.ack = n.seq + n.payload.byteLength;
-          if (!(n.flags & 1)) await w(r, f, new Uint8Array());
-          r.waiters.length ? r.waiters.shift()(n.payload) : r.queue.push(n.payload);
-        }
-        if (n.flags & 1) {
-          r.ack = n.seq + n.payload.byteLength + 1;
-          await w(r, 17, new Uint8Array()); // FIN | ACK; FIN consumes one sequence number.
-          r.seq += 1;
-          releaseDeviceStream(r, { notify: false, discard: false, reason: "Device finished stream" });
-        }`,
-    `        if (n.payload.byteLength || (n.flags & 1)) await receiveDeviceData(r, n);`,
-  ],
-];
-const v4Replacements = [...v3Replacements, ...recoveryReplacements];
-const v4Helpers = v3Helpers.replace(v3Marker, v4Marker) + `
 // Only acknowledge contiguous bytes. Retransmitted or overlapping segments must
 // not corrupt Lockdown TLS, HTTP or the tunneled TCP byte stream.
-async function receiveDeviceData(stream, packet) {
+function receiveDeviceData(stream, packet) {
   if (!stream.established) return;
   if (!seqAtOrBefore(packet.seq, stream.ack)) {
-    await w(stream, f, new Uint8Array());
+    queueDeviceAck(stream);
     return;
   }
   const consumed = (stream.ack - packet.seq) >>> 0;
   const payload = packet.payload.subarray(Math.min(consumed, packet.payload.byteLength));
   if (payload.byteLength) {
+    const retained = (stream.readRetainedBytes ?? 0) + payload.byteLength;
+    if (retained > DEVICE_READ_LIMIT) {
+      // A one-byte zero-window probe is legal. Keep the cumulative ACK fixed
+      // so the peer retries this byte after the consumer releases credit.
+      if ((stream.readRetainedBytes ?? 0) === DEVICE_READ_LIMIT && payload.byteLength === 1) {
+        queueDeviceAck(stream);
+        return;
+      }
+      releaseDeviceStream(stream, { reason: "USB receive window exceeded" });
+      return;
+    }
+    stream.readRetainedBytes = retained;
     stream.ack = (stream.ack + payload.byteLength) >>> 0;
     stream.waiters.length ? stream.waiters.shift()(payload) : stream.queue.push(payload);
   }
   const finished = (packet.flags & 1) && ((packet.seq + packet.payload.byteLength) >>> 0) === stream.ack;
   if (finished) {
     stream.ack = (stream.ack + 1) >>> 0;
-    await w(stream, 17, new Uint8Array());
+    void w(stream, 17, new Uint8Array()).catch(() => {});
     stream.seq = (stream.seq + 1) >>> 0;
     releaseDeviceStream(stream, { notify: false, discard: false, reason: "Device finished stream" });
   } else {
-    await w(stream, f, new Uint8Array());
+    queueDeviceAck(stream);
   }
 }
-`;
 
-// ACKs use the existing serialized USB writer, but never hold the receive loop.
-// At most one write and one cumulative update can be pending per stream.
-const v5Replacements = [
-  ...v4Replacements,
-  [
-    "  return e.writeChain = e.writeChain.then(async () => {",
-    `  if ((e.pendingMuxWrites ?? 0) >= 256) {
-    I(e);
-    throw new Error("USB output queue exceeded");
-  }
-  e.pendingMuxWrites = (e.pendingMuxWrites ?? 0) + 1;
-  return e.writeChain = e.writeChain.then(async () => {`,
-  ],
-  [
-    `    if (!e.closed) I(e);
-    throw error;
-  }), e.writeChain;`,
-    `    if (!e.closed) I(e);
-    throw error;
-  }).finally(() => { e.pendingMuxWrites -= 1; }), e.writeChain;`,
-  ],
-  [
-    "          await w(reset, n.flags & f ? G : G | f, new Uint8Array());",
-    "          void w(reset, n.flags & f ? G : G | f, new Uint8Array()).catch(() => {});",
-  ],
-  [
-    "          await w(r, f, new Uint8Array());\n          r.resolveOpened();",
-    "          queueDeviceAck(r);\n          r.resolveOpened();",
-  ],
-  [
-    "        if (n.payload.byteLength || (n.flags & 1)) await receiveDeviceData(r, n);",
-    `        if (n.payload.byteLength || (n.flags & 1)) receiveDeviceData(r, n);
-        else if (n.seq === ((r.ack - 1) >>> 0)) queueDeviceAck(r);`,
-  ],
-];
-const v5Helpers = v4Helpers
-  .replace(v4Marker, v5Marker)
-  .replace("async function receiveDeviceData(stream, packet)", "function receiveDeviceData(stream, packet)")
-  .replaceAll("await w(stream, f, new Uint8Array());", "queueDeviceAck(stream);")
-  .replace("await w(stream, 17, new Uint8Array());", "void w(stream, 17, new Uint8Array()).catch(() => {});") + `
 function queueDeviceAck(stream) {
   if (stream.closed || stream.session.closed) return;
   stream.ackNeeded = true;
@@ -486,87 +600,7 @@ function queueDeviceAck(stream) {
     }
   })();
 }
-`;
 
-// Keep the v5 layout above intact so existing installations can be authenticated
-// and migrated. Bound the opposite (phone -> browser -> VPS) direction as well.
-const v6Replacements = [
-  ...v5Replacements,
-  [
-    '  let n, r;\n  const a = {',
-    '  if (e.streams.size >= 64) throw new Error("USB stream limit exceeded");\n  let n, r;\n  const a = {',
-  ],
-  ['a.setUint16(14, 512)', 'a.setUint16(14, deviceReceiveWindow(e))'],
-  [
-    '    if (this.closed) return;\n    try {\n      const a = await Q(this.session, r, stream => this.streams.set(n, stream));',
-    `    if (this.closed) return;
-    if (this.streams.size >= 64) {
-      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
-        payload: l({ ok: false, error: "USB stream limit exceeded" }) });
-      return;
-    }
-    if (r === 9100 && performance.now() < (this.previewSuspendedUntil ?? 0)) {
-      await this.send({ type: s.OpenResult, requestId: t, streamId: n,
-        payload: l({ ok: false, error: "Preview paused for uplink congestion" }) });
-      return;
-    }
-    try {
-      const a = await Q(this.session, r, stream => this.streams.set(n, stream));`,
-  ],
-  [
-    `        await this.send({
-          type: s.StreamData,
-          requestId: 0,
-          streamId: t,
-          payload: r
-        });`,
-    `        try {
-          await this.send({ type: s.StreamData, requestId: 0, streamId: t, payload: r });
-        } finally {
-          consumeDeviceRead(n, r.byteLength);
-        }`,
-  ],
-  [
-    '        await this.send({\n          type: s.Pong,',
-    '        void this.send({\n          type: s.Pong,',
-  ],
-  [
-    '          payload: new Uint8Array()\n        });\n        break;',
-    '          payload: new Uint8Array()\n        }).catch(error => this.log("Relay heartbeat send failed", h(error)));\n        break;',
-  ],
-  [
-    `  async send(t) {
-    if (!this.closed) {
-      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-        this.closed = !0;
-        return;
-      }
-      this.socket.send(_(t));
-    }
-  }`,
-    `  async send(t) { await sendBoundedRelayFrame(this, t); }`,
-  ],
-];
-const v6Helpers = v5Helpers.replace(v5Marker, v6Marker)
-  .replace('  if (discard) stream.queue.length = 0;', `  if (discard) {
-    stream.queue.length = 0;
-    stream.readRetainedBytes = 0;
-    stream.readDiscarded = true;
-  }`)
-  .replace('  if (payload.byteLength) {\n    stream.ack =', `  if (payload.byteLength) {
-    const retained = (stream.readRetainedBytes ?? 0) + payload.byteLength;
-    if (retained > DEVICE_READ_LIMIT) {
-      // A one-byte zero-window probe is legal. Keep the cumulative ACK fixed
-      // so the peer retries this byte after the consumer releases credit.
-      if ((stream.readRetainedBytes ?? 0) === DEVICE_READ_LIMIT && payload.byteLength === 1) {
-        queueDeviceAck(stream);
-        return;
-      }
-      releaseDeviceStream(stream, { reason: "USB receive window exceeded" });
-      return;
-    }
-    stream.readRetainedBytes = retained;
-    stream.ack =`) + `
 // Credit includes the chunk held by the relay pump until WebSocket accepts it.
 // Shrinking only this stream's advertised window leaves USB demux/ACKs running.
 const DEVICE_READ_LIMIT = 128 * 1024;
@@ -585,7 +619,7 @@ async function sendBoundedRelayFrame(relay, frame) {
   const data = frame.type === s.StreamData;
   const stream = data ? relay.streams.get(frame.streamId) : null;
   if (data && !stream) return;
-  const preview = stream?.dport === 9100;
+  const preview = stream?.dport === 9100; // Reserve control capacity for ALL media, including single frames.
   // Reserve room for control responses, then a further reserve for protocol
   // messages. All checks and socket.send are synchronous once credit is free.
   const limit = preview ? 128 * 1024 : data ? 384 * 1024 : 512 * 1024;
@@ -606,11 +640,14 @@ async function sendBoundedRelayFrame(relay, frame) {
         relay.uplinkWaitCount = (relay.uplinkWaitCount ?? 0) + 1;
       }
       const elapsed = performance.now() - started;
-      if (preview && elapsed >= 2000) {
+      if (preview && relay.continuousPreviewEnabled === true && elapsed >= 2000) {
         relay.previewPauses = (relay.previewPauses ?? 0) + 1;
         relay.previewSuspendedUntil = performance.now() + 30000;
         relay.log("Preview paused for uplink congestion", relay.socket.bufferedAmount ?? 0);
         throw new Error("Preview paused for uplink congestion");
+      }
+      if (preview && relay.continuousPreviewEnabled !== true && elapsed >= 8000) {
+        throw new Error("Screenshot uplink congested");
       }
       if (elapsed >= 20000) {
         relay.log("Relay uplink stalled", relay.socket.bufferedAmount ?? 0);
@@ -628,52 +665,22 @@ async function sendBoundedRelayFrame(relay, frame) {
 }
 `;
 
-// Port 9100 also serves one-frame task observations. Only an explicitly enabled
-// continuous viewer may impose its cooldown on subsequent stream opens.
-const replacements = v6Replacements.map(([before, after]) => [before,
-  after.replace('r === 9100 && performance.now()',
-    'r === 9100 && this.continuousPreviewEnabled === true && performance.now()')]);
-const helpers = v6Helpers.replace(v6Marker, marker)
-  .replace('const preview = stream?.dport === 9100;',
-    'const preview = stream?.dport === 9100; // Reserve control capacity for ALL media, including single frames.')
-  .replace('if (preview && elapsed >= 2000)',
-    'if (preview && relay.continuousPreviewEnabled === true && elapsed >= 2000)')
-  .replace('      if (elapsed >= 20000) {', `      if (preview && relay.continuousPreviewEnabled !== true && elapsed >= 8000) {
-        throw new Error("Screenshot uplink congested");
-      }
-      if (elapsed >= 20000) {`);
-
 function digest(text) {
   return createHash("sha256").update(text).digest("hex");
 }
-// Reverse our exact edits to authenticate both fresh and previously patched files.
-const applied = source.includes(marker)
-  ? { helpers, replacements }
-  : source.includes(v6Marker)
-    ? { helpers: v6Helpers, replacements: v6Replacements }
-  : source.includes(v5Marker)
-    ? { helpers: v5Helpers, replacements: v5Replacements }
-  : source.includes(v4Marker)
-    ? { helpers: v4Helpers, replacements: v4Replacements }
-  : source.includes(v3Marker)
-    ? { helpers: v3Helpers, replacements: v3Replacements }
-  : source.includes(v2Marker)
-    ? {
-        helpers: v2Helpers,
-        replacements: [...streamReplacements, ...framingReplacements],
-      }
-    : source.includes(legacyMarker)
-      ? { helpers: legacyHelpers, replacements: streamReplacements }
-      : null;
-if (applied) {
-  if (!source.endsWith(applied.helpers))
+if (source.includes(marker)) {
+  if (!source.endsWith(helpers))
     throw new Error("Unexpected device-install patch contents");
-  source = source.slice(0, -applied.helpers.length);
-  for (const [before, after] of [...applied.replacements].reverse()) {
+  source = source.slice(0, -helpers.length);
+  for (const [before, after] of [...replacements].reverse()) {
     if (source.split(after).length !== 2)
       throw new Error("Unexpected device-install patched code");
     source = source.replace(after, before);
   }
+} else if (source.includes(markerPrefix)) {
+  throw new Error(
+    "device-install was patched by an older layout; reinstall it with `npm ci`",
+  );
 }
 if (digest(source) !== originalHash)
   throw new Error("Unexpected device-install 0.1.0 ESM checksum");
