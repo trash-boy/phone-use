@@ -821,3 +821,26 @@ test('screenshots load from screen.jpg as object URLs, revoke the previous one, 
   }
   assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/screen.jpg')).length), jpegCalls + 1);
 });
+
+test("a long task shows the total step count and each kept step's own number", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "Long fixture task", state: "running", confirmation: null, totalSteps: 250,
+      steps: [
+        { id: "a", number: 249, tool: "iphone_tap", reason: "Older kept step", state: "completed" },
+        { id: "b", number: 250, tool: "iphone_tap", reason: "Newest step", state: "running" },
+      ],
+    };
+  });
+  await page.locator(".step-count").filter({ hasText: "250 步" }).waitFor();
+  assert.deepEqual(await page.locator(".step-number").allTextContents(), ["249", "250"]);
+  // Older gateways: no totalSteps/number, so count and number by position.
+  await page.evaluate(() => {
+    fixture.state.task = { ...fixture.state.task, totalSteps: undefined,
+      steps: fixture.state.task.steps.map(({ number, ...step }) => step) };
+  });
+  await page.locator(".step-count").filter({ hasText: "2 步" }).waitFor();
+  assert.deepEqual(await page.locator(".step-number").allTextContents(), ["1", "2"]);
+});

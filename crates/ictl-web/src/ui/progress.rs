@@ -53,6 +53,11 @@ fn step_label(state: &str) -> String {
 }
 /// Instruction for a new task resuming a failed or stopped one. The gateway also
 /// gives the model the previous task's summary as session history.
+/// Steps taken so far. Snapshots carry only the newest steps plus `totalSteps`;
+/// older gateways send every step and no total.
+fn total_steps(task: &Value) -> u64 {
+    task["totalSteps"].as_u64().unwrap_or_else(|| task["steps"].as_array().map_or(0, |s| s.len() as u64))
+}
 fn continue_instruction(task: &Value) -> String {
     let goal = string(task, "instruction");
     let reason = [string(task, "error"), string(task, "message")].into_iter().find(|s| !s.is_empty());
@@ -107,7 +112,7 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                         {move || state_label(&ui.task.with(|t| string(t, "state")))}
                         <span class="step-count">
                             {move || {
-                                format!("{} 步", ui.task.read()["steps"].as_array().map_or(0, Vec::len))
+                                format!("{} 步", ui.task.with(total_steps))
                             }}
                         </span>
                     </div>
@@ -244,9 +249,12 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                                 .into_iter()
                                 .enumerate()
                                 .map(|(i, step)| {
+                                    // The gateway keeps only the newest steps; `number` is the
+                                    // step's position in the whole task (older gateways: index).
+                                    let number = step["number"].as_u64().unwrap_or(i as u64 + 1);
                                     view! {
                                         <li class=format!("step {}", string(&step, "state"))>
-                                            <span class="step-number">{i + 1}</span>
+                                            <span class="step-number">{number}</span>
                                             <div>
                                                 <strong>
                                                     {tool_label(&string(&step, "tool"))}
