@@ -4,6 +4,10 @@
 //! - 设备相关的状态在 [`Inner`] 里，一把锁串行访问：HID 会话、WDA 会话只能有一个持有者，
 //!   也不会出现 toolkit 那种「长请求期间被巡检误判 WDA 挂了」的问题
 //! - 每个控制请求一个任务，拿到锁才执行；巡检（[`crate::supervise`]）拿不到锁就跳过这一轮
+//! - 巡检持锁只做改状态的部分：列设备、WDA 的 `/status` 探测（走单独的连接）在锁外做，回来时按
+//!   [`Inner::wda_generation`] 核对 WDA 客户端没换过才用结果；从不持锁睡眠
+//! - 请求里碰到 WDA 连不上，之后一小段时间（[`WDA_UNREACHABLE_HOLD`]）不再碰它，直接走 HID 后备，
+//!   免得一次请求里几个 WDA 调用各等一次建连接超时，加起来超过 [`STALE`]
 //! - 耗时的事不持锁：启动 WDA（含挂开发者镜像，最长约 2 分钟）、重签、会话检查在后台跑，做完再持锁写结果
 //! - `status` 读发布出来的快照（watch 通道），不碰锁
 //! - 改变手机状态的请求排队超过 [`STALE`] 就放弃，免得点击落到已经变了的屏幕上
@@ -16,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ictl_device::{AppInfo, Device, DeviceError, DeviceInfo, Rotation, ScreenSize, Tunnel, UsbDevice};
 use ictl_unlock::UnlockConfig;
 use ictl_wda::timing::StepTimer;
-use ictl_wda::{WdaClient, WdaRunner, http::DeviceTransport};
+use ictl_wda::{WdaClient, WdaRunner, http::DeviceTransport, http::Transport};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
@@ -27,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::config::Config;
 use crate::diagnostics::{Diagnostics, HealthDiagnostics};
 use crate::eventlog::EventLog;
-use crate::machine::{Backoff, DeviceState, Misses, MuxWatch};
+use crate::machine::{Backoff, DeviceState, LinkDown, Misses, MuxWatch};
 use crate::notify::{self, Dedup, Event};
 use crate::protocol::{Request, Response};
 use crate::supervise::StartOutcome;
@@ -36,10 +40,55 @@ use ictl_wda::diagnostics::StopReason;
 pub const TICK: Duration = Duration::from_secs(10);
 /// 改变手机状态的请求排队超过这么久就放弃
 pub const STALE: Duration = ictl_protocol::ACTION_LIFETIME;
+/// 请求里碰到 WDA 连不上之后多久内不再碰它（见 [`Inner::wda_unreachable_until`]）
+pub const WDA_UNREACHABLE_HOLD: Duration = Duration::from_secs(5);
 /// 长按、滑动的时长上限（秒）：HID 拖动按时长换算采样点，不设上限一个请求就能占住设备很久
 pub const MAX_GESTURE_SECONDS: f64 = 10.0;
 /// 等界面稳定、等元素出现的上限（毫秒）：持着设备锁等，不能太久
 pub const MAX_WAIT_MS: u64 = 30_000;
+
+/// 守护进程持有的 WDA 客户端用的传输：正式是经 usbmuxd 直连设备的 [`DeviceTransport`]，
+/// 单测里换成 [`ictl_wda::fake::ScriptedWda`]，不用真机就能测工具层的规则（例如什么时候能退到 HID）
+#[derive(Clone)]
+pub(crate) enum WdaLink {
+    Device(DeviceTransport),
+    #[cfg(test)]
+    Fake(ictl_wda::fake::ScriptedWda),
+}
+
+impl Transport for WdaLink {
+    async fn screenshot_jpeg(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Device(t) => t.screenshot_jpeg().await,
+            #[cfg(test)]
+            Self::Fake(t) => t.screenshot_jpeg().await,
+        }
+    }
+
+    async fn health(&self) -> std::io::Result<(u16, Vec<u8>)> {
+        match self {
+            Self::Device(t) => t.health().await,
+            #[cfg(test)]
+            Self::Fake(t) => t.health().await,
+        }
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        match self {
+            Self::Device(t) => t.send(method, path, body, timeout).await,
+            #[cfg(test)]
+            Self::Fake(t) => t.send(method, path, body, timeout).await,
+        }
+    }
+}
+
+pub(crate) type Wda = WdaClient<WdaLink>;
 
 /// 持久化到 `state.json` 的状态（不含秘密）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -204,12 +253,21 @@ pub(crate) struct Inner {
     pub connected: Vec<UsbDevice>,
     /// 各设备的名字、型号（第一次见到时读一次）
     pub infos: HashMap<String, DeviceInfo>,
+    /// 读不出名字、型号的设备（例如没信任）下次什么时候再读、下次再失败等多久（按 UDID 退避）
+    pub info_retry: HashMap<String, (Instant, Duration)>,
     /// HID 和截图用的隧道（HID 会话归它所有）
     pub tunnel: Option<Tunnel>,
     /// WDA 最近一次报的界面旋转及读取时间。只在短暂掉线时给 HID 使用，不持久化；换设备时清掉
     pub wda_rotation: Option<(Instant, Rotation)>,
     pub runner: Option<WdaRunner>,
-    pub wda: Option<WdaClient<DeviceTransport>>,
+    pub wda: Option<Wda>,
+    /// 每换一次 WDA 客户端（拉起、丢掉）加 1。巡检在锁外探测 `/status`，回来时代数变了就不用那个结果
+    pub wda_generation: u64,
+    /// 请求里刚碰到 WDA 连不上的时刻往后这段时间内，同一请求和紧接着的请求不再碰 WDA，直接走 HID 后备
+    /// （每次连不上最长要等 10 秒建连接，几次叠起来就超过 [`STALE`]）。巡检确认 WDA 就绪时清掉
+    pub wda_unreachable_until: Option<Instant>,
+    /// 连续连不上 WDA 的起点（巡检的 `/status`），持续太久就重启 WDA（[`crate::machine::LINK_DOWN_RESTART`]）
+    pub wda_link_down: LinkDown,
     /// 后台启动 WDA 的任务（含挂开发者镜像），巡检里收结果
     pub starting: Option<JoinHandle<StartOutcome>>,
     /// 开发者镜像连续挂载失败次数，到 3 次清缓存重新下载
@@ -238,6 +296,9 @@ pub(crate) struct Inner {
     pub settled_tree: Option<(Instant, ictl_wda::elements::Tree)>,
     /// HID 会话最近一次使用的时间；空闲超过 [`crate::supervise::HID_IDLE`] 就关掉（它持有屏幕媒体流）
     pub hid_used: Option<Instant>,
+    /// 最近一次 HID 截图的像素宽高和时间。HID 触摸前核对横竖只要宽高，
+    /// [`crate::tools::HID_FRAME_REUSE`] 内不再为了它截一整张 PNG
+    pub hid_frame: Option<(Instant, (u32, u32))>,
     /// 最近一次读到的元素树。只在调用方允许（max_age_ms）时复用；改变界面的操作做完就清掉
     pub elements_cache: Option<(Instant, ictl_wda::elements::Tree)>,
     pub dedup: Dedup,
@@ -328,10 +389,14 @@ impl Daemon {
             info: None,
             connected: Vec::new(),
             infos: HashMap::new(),
+            info_retry: HashMap::new(),
             tunnel: None,
             wda_rotation: None,
             runner: None,
             wda: None,
+            wda_generation: 0,
+            wda_unreachable_until: None,
+            wda_link_down: LinkDown::default(),
             starting: None,
             ddi_failures: 0,
             resigning: false,
@@ -349,6 +414,7 @@ impl Daemon {
             unlocked_at: None,
             settled_tree: None,
             hid_used: None,
+            hid_frame: None,
             elements_cache: None,
             dedup: Dedup::default(),
             // 启动一分钟后再做第一次重签检查和会话验证，先让设备就绪
@@ -472,7 +538,7 @@ impl Daemon {
 
     /// 丢掉整个会话：runner、WDA 客户端、正在后台启动的任务、隧道（先停 HID 媒体流）
     pub(crate) async fn drop_session(&self, g: &mut Inner, reason: StopReason) {
-        self.diagnostics.lock().unwrap().stop(reason);
+        crate::diagnostics::lock(&self.diagnostics).stop(reason);
         if let Some(h) = g.starting.take() {
             h.abort();
         }
@@ -480,6 +546,10 @@ impl Daemon {
             r.stop_with_reason(reason);
         }
         g.wda = None;
+        g.wda_generation += 1;
+        g.wda_unreachable_until = None;
+        g.wda_link_down.reset();
+        g.hid_frame = None;
         g.elements_cache = None;
         g.settled_tree = None;
         g.unlocked_at = None;
@@ -499,12 +569,30 @@ impl Daemon {
         Ok(g.tunnel.as_mut().expect("刚建好"))
     }
 
-    /// WDA 可用就返回客户端（本进程 runner 存活）
-    pub(crate) fn wda<'a>(&self, g: &'a mut Inner) -> Option<&'a mut WdaClient<DeviceTransport>> {
+    /// WDA 可用就返回客户端（本进程 runner 存活，且刚才没碰到连不上，见 [`Inner::wda_unreachable_until`]）
+    pub(crate) fn wda<'a>(&self, g: &'a mut Inner) -> Option<&'a mut Wda> {
+        if g.wda_unreachable_until.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
         if g.runner.as_ref().is_some_and(|r| r.alive()) { g.wda.as_mut() } else { None }
     }
 
-    pub(crate) fn require_wda<'a>(&self, g: &'a mut Inner) -> Result<&'a mut WdaClient<DeviceTransport>, String> {
+    /// 记下 WDA 连不上（[`ictl_wda::WdaError::Unavailable`]）：之后 [`WDA_UNREACHABLE_HOLD`] 内不再碰 WDA。
+    /// 只有连不上才算；超时、中途断开说明请求可能已经发出，照旧报错、不退到 HID
+    pub(crate) fn note_wda_error(&self, g: &mut Inner, e: &ictl_wda::WdaError) {
+        if matches!(e, ictl_wda::WdaError::Unavailable(_)) {
+            self.trip_wda_breaker(g);
+        }
+    }
+
+    pub(crate) fn trip_wda_breaker(&self, g: &mut Inner) {
+        if g.wda_unreachable_until.is_none_or(|t| Instant::now() >= t) {
+            tracing::info!(event = "wda_breaker_open", hold_ms = WDA_UNREACHABLE_HOLD.as_millis() as u64);
+        }
+        g.wda_unreachable_until = Some(Instant::now() + WDA_UNREACHABLE_HOLD);
+    }
+
+    pub(crate) fn require_wda<'a>(&self, g: &'a mut Inner) -> Result<&'a mut Wda, String> {
         let msg = wda_down(&g.state, g.info.as_ref());
         self.wda(g).ok_or(msg)
     }
@@ -578,7 +666,7 @@ impl Daemon {
                 s.unlock_disabled = unlock.disabled_by_failure();
                 s.auto_unlock = unlock.enabled();
                 s.log_tail = self.log.tail(15);
-                s.diagnostics = Some(self.diagnostics.lock().unwrap().snapshot());
+                s.diagnostics = Some(crate::diagnostics::lock(&self.diagnostics).snapshot());
                 return Response::text(serde_json::to_string_pretty(&s).unwrap_or_default());
             }
             // 重签自己分段持锁：签名、安装要几十秒，期间不挡住别的请求

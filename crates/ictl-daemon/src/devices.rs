@@ -3,9 +3,21 @@
 //! 同一时间只控制一台（一个 WDA 会话、一把设备锁）。选哪台见 [`crate::machine::pick_device`]：
 //! 选定了就只认那一台；没选定时正在控制的那台一直用到它断开。切换时拆掉上一台的会话，在新的一台上拉起 WDA
 
+use std::time::{Duration, Instant};
+
 use ictl_device::{Device, DeviceInfo, UsbDevice};
 
 use crate::core::{Daemon, Inner, device_label};
+
+/// 读不出设备信息后第一次多久再读
+pub const INFO_RETRY_START: Duration = Duration::from_secs(10);
+/// 退避的上限
+pub const INFO_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// 上一次等了 `last`（第一次失败是 None），这次等多久
+pub fn info_retry_delay(last: Option<Duration>) -> Duration {
+    last.map_or(INFO_RETRY_START, |d| (d * 2).min(INFO_RETRY_MAX))
+}
 
 /// 按 UDID 或设备名找设备，返回下标：先比 UDID（不分大小写），再比设备名，最后是设备名包含这段文字且只有一台
 pub fn resolve_device(devices: &[DeviceInfo], query: &str) -> Result<usize, String> {
@@ -36,13 +48,25 @@ pub fn resolve_device(devices: &[DeviceInfo], query: &str) -> Result<usize, Stri
 }
 
 impl Daemon {
-    /// 记下这一轮 USB 上接着的设备；新接上的读一次名字、型号
+    /// 记下这一轮 USB 上接着的设备；新接上的读一次名字、型号。读不出来的（例如还没信任，一次最长约 15 秒、持着锁）
+    /// 按 UDID 退避再读：[`INFO_RETRY_START`] 起翻倍，最多 [`INFO_RETRY_MAX`]；拔掉后重新计
     pub(crate) async fn note_connected(&self, g: &mut Inner, devices: Vec<UsbDevice>) {
+        let now = Instant::now();
+        g.info_retry.retain(|u, _| devices.iter().any(|d| d.udid == *u));
         for d in &devices {
-            if !g.infos.contains_key(&d.udid)
-                && let Ok(i) = Device::from_usb(d).info().await
-            {
-                g.infos.insert(d.udid.clone(), i);
+            if g.infos.contains_key(&d.udid) || g.info_retry.get(&d.udid).is_some_and(|(at, _)| now < *at) {
+                continue;
+            }
+            match Device::from_usb(d).info().await {
+                Ok(i) => {
+                    g.infos.insert(d.udid.clone(), i);
+                    g.info_retry.remove(&d.udid);
+                }
+                Err(e) => {
+                    let delay = info_retry_delay(g.info_retry.get(&d.udid).map(|(_, d)| *d));
+                    tracing::debug!("读 {} 的设备信息失败，{} 秒后再试：{e}", d.udid, delay.as_secs());
+                    g.info_retry.insert(d.udid.clone(), (Instant::now() + delay, delay));
+                }
             }
         }
         g.connected = devices;
@@ -149,7 +173,7 @@ impl Daemon {
         // 上一台的锁屏时间不能拿来等这一台
         g.last_lock = None;
         g.unlocked_at = None;
-        self.online(g, &usb).await;
+        self.online_now(g, &usb).await;
         let pin = if self.cfg.passcode_file_for(&target.udid).is_file() {
             ""
         } else {
@@ -189,6 +213,19 @@ mod tests {
         let odd = cfg.passcode_file_for("../../etc/x");
         assert_eq!(odd.parent(), Some(cfg.passcodes_dir().as_path()));
         assert_ne!(cfg.passcode_file_for("A"), cfg.legacy_passcode_file());
+    }
+
+    #[test]
+    fn unreadable_device_info_is_retried_with_backoff() {
+        let mut d = None;
+        let delays: Vec<u64> = (0..7)
+            .map(|_| {
+                let next = info_retry_delay(d);
+                d = Some(next);
+                next.as_secs()
+            })
+            .collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 300, 300]);
     }
 
     #[test]

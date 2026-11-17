@@ -164,6 +164,28 @@ impl<T: Transport> WdaClient<T> {
             mjpeg_motion_broken: false,
         }
     }
+    /// 换一层传输（例如包进调用方自己的枚举），会话、缓存的尺寸和设置原样保留
+    pub fn map_transport<U>(self, f: impl FnOnce(T) -> U) -> WdaClient<U> {
+        WdaClient {
+            transport: f(self.transport),
+            session: self.session,
+            screen: self.screen,
+            lock_state_trusted: self.lock_state_trusted,
+            orientation_cache: self.orientation_cache,
+            idle_baseline: self.idle_baseline,
+            idle_current: self.idle_current,
+            low_latency: self.low_latency,
+            bounded_capture: self.bounded_capture,
+            profile_applied: self.profile_applied,
+            mjpeg_motion_broken: self.mjpeg_motion_broken,
+        }
+    }
+
+    /// 底层传输。只读探测（`/status`）可以拿它的副本另开一个客户端，在设备锁外面做
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     /// Dedicated browser-control session. Ordinary MCP clients retain their defaults.
     pub fn with_low_latency(mut self, enabled: bool) -> Self {
         self.low_latency = enabled;
@@ -675,6 +697,11 @@ impl<T: Transport> WdaClient<T> {
         }
         self.set_idle_settings(during).await?;
         let r = self.actions(steps).await;
+        if matches!(r, Err(WdaError::Unavailable(_))) {
+            // 连不上：恢复设置也连不上（每次最长要等 10 秒建连接），不试了；下次手势照常先设再恢复
+            self.idle_current = None;
+            return r;
+        }
         if let Err(e) = self.set_idle_settings(baseline).await {
             tracing::warn!("手势后恢复 WDA 等待设置失败：{e}");
         }

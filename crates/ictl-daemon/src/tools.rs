@@ -8,12 +8,11 @@ use ictl_unlock::UnlockError;
 use ictl_wda::client::SPRINGBOARD;
 use ictl_wda::diagnostics::StopReason;
 use ictl_wda::elements::{self, TapPoint, Tree};
-use ictl_wda::http::DeviceTransport;
 use ictl_wda::timing::StepTimer;
-use ictl_wda::{Launch, WdaClient, WdaError};
+use ictl_wda::{Launch, WdaError};
 
 use crate::config::CapturePolicy;
-use crate::core::{Daemon, Inner, drop_tunnel, hid_supported, wda_down};
+use crate::core::{Daemon, Inner, Wda, drop_tunnel, hid_supported, wda_down};
 use crate::imaging::{self, fmt_g};
 use crate::notify::Event;
 use crate::protocol::{ALERT_BLOCKING, Response, TAP_MISSED};
@@ -64,6 +63,8 @@ const SCROLL_SETTLE: Duration = Duration::from_millis(2500);
 const NEEDS_WDA: &str = "读界面元素、按名字点击、启动 App、输入中文要等 WDA 恢复";
 const NEEDS_WDA_EN: &str =
     "reading elements, tapping by text, launching apps and typing non-ASCII text wait until WDA is back";
+/// HID 触摸前核对横竖时，这么久内截过的 HID 图的宽高直接用
+pub(crate) const HID_FRAME_REUSE: Duration = Duration::from_secs(2);
 /// 按 Home 后最多等这么久，确认主屏到了前台（iPhone 12 mini 上 IOHID 的 Home 约 1.3～1.5 秒）
 const HOME_SETTLE: Duration = Duration::from_secs(2);
 /// 按电源键后最多等这么久，等 WDA 报锁屏（iPhone 12 mini 实测约 1 秒）
@@ -92,6 +93,12 @@ impl Daemon {
         let Some(wda) = self.wda(g) else { return Ok(()) };
         let outcome = ictl_unlock::ensure_unlocked(wda, &cfg).await;
         checking.finish(outcome.is_ok());
+        // 连不上 WDA：这个请求接下来不再碰它（见 Inner::wda_unreachable_until），坐标类操作直接走 HID
+        match &outcome {
+            Ok(ictl_unlock::Outcome::Unknown) => self.trip_wda_breaker(g),
+            Err(UnlockError::Wda(e)) => self.note_wda_error(g, e),
+            _ => {}
+        }
         // 只有确认过没锁才记下：WDA 连不上（Unknown）时不知道锁没锁，记下的话之后 20 秒内的 HID 操作都不再检查
         g.unlocked_at = outcome.as_ref().is_ok_and(|o| o.confirmed_unlocked()).then(Instant::now);
         // A WDA that keeps timing out on the lock query is stuck (seen after the phone slept through a long
@@ -122,10 +129,11 @@ impl Daemon {
     }
 
     async fn screen(&self, g: &mut Inner) -> Result<ScreenSize, String> {
-        if let Some(w) = self.wda(g)
-            && let Ok(s) = w.screen_size().await
-        {
-            return Ok(s);
+        if let Some(w) = self.wda(g) {
+            match w.screen_size().await {
+                Ok(s) => return Ok(s),
+                Err(e) => self.note_wda_error(g, &e),
+            }
         }
         // 记下的尺寸是别的设备的就不用（旧版本没记是哪台，照用）
         let same = match (&g.persisted.screen_udid, &g.device) {
@@ -142,10 +150,10 @@ impl Daemon {
 
     /// 记下 WDA 报的界面旋转角：WDA 挂了以后 HID 点击要靠它换算横屏坐标（约 20 毫秒）
     pub(crate) async fn refresh_hid_rotation(&self, g: &mut Inner) {
-        if let Some(w) = self.wda(g)
-            && let Ok(r) = w.rotation().await
-        {
-            g.wda_rotation = Some((Instant::now(), r));
+        let Some(w) = self.wda(g) else { return };
+        match w.rotation().await {
+            Ok(r) => g.wda_rotation = Some((Instant::now(), r)),
+            Err(e) => self.note_wda_error(g, &e),
         }
     }
 
@@ -153,14 +161,22 @@ impl Daemon {
     /// 截图只给宽高，不能分辨横屏左右；短暂掉线时借用近期 WDA 方向，过期或不匹配就不触摸。
     async fn hid_touch_rotation(&self, g: &mut Inner) -> Result<Rotation, String> {
         self.refresh_hid_rotation(g).await;
-        let png = self.hid_screenshot(g).await.map_err(|e| {
-            ictl_l10n::trf!(
-                "核对 HID 方向失败，没有发送触摸：{e}",
-                "Checking the HID orientation failed, no touch sent: {e}"
-            )
-        })?;
-        let (w, h) = imaging::png_size(&png)
-            .ok_or(ictl_l10n::tr!("无法读取截图尺寸，没有发送触摸", "Can't read the screenshot size, no touch sent"))?;
+        // 只要宽高：[`HID_FRAME_REUSE`] 内截过 HID 图就用它的，不再为此截一整张 PNG（约 1 秒）
+        let (w, h) = match g.hid_frame.filter(|(at, _)| at.elapsed() < HID_FRAME_REUSE) {
+            Some((_, size)) => size,
+            None => {
+                let png = self.hid_screenshot(g).await.map_err(|e| {
+                    ictl_l10n::trf!(
+                        "核对 HID 方向失败，没有发送触摸：{e}",
+                        "Checking the HID orientation failed, no touch sent: {e}"
+                    )
+                })?;
+                imaging::png_size(&png).ok_or(ictl_l10n::tr!(
+                    "无法读取截图尺寸，没有发送触摸",
+                    "Can't read the screenshot size, no touch sent"
+                ))?
+            }
+        };
         let known = g.wda_rotation.map(|(at, r)| (at.elapsed(), r));
         hid_rotation(w, h, known)
     }
@@ -174,8 +190,12 @@ impl Daemon {
         let device = g.device.clone().ok_or(ictl_l10n::tr!("手机未连接", "Phone not connected"))?;
         let t = self.ensure_tunnel(g, &device).await.map_err(|e| e.to_string())?;
         match t.screenshot_png().await {
-            Ok(p) => Ok(p),
+            Ok(p) => {
+                g.hid_frame = imaging::png_size(&p).map(|size| (Instant::now(), size));
+                Ok(p)
+            }
             Err(e) => {
+                g.hid_frame = None;
                 drop_tunnel(g).await;
                 Err(e.to_string())
             }
@@ -307,7 +327,10 @@ impl Daemon {
         .await;
         match r {
             Ok(t) => format!("{t}\n{daemon_line}"),
-            Err(e) => format!("{e}\n{}\n{daemon_line}", needs_wda()),
+            Err(e) => {
+                self.note_wda_error(g, &e);
+                format!("{e}\n{}\n{daemon_line}", needs_wda())
+            }
         }
     }
 
@@ -316,6 +339,11 @@ impl Daemon {
         g: &mut Inner,
         region: Option<(f64, f64, f64, f64)>,
     ) -> Result<Response, String> {
+        // 区域放大要从原始像素裁剪；有界截图策略只许用缩小、压缩过的 MJPEG 帧，裁出来是糊的：直接说不支持
+        if region.is_some() && self.cfg.capture_policy == CapturePolicy::BoundedRemote {
+            tracing::warn!(event = "capture_rejected", category = "region_under_bounded_policy");
+            return Err(ictl_wda::client::FULL_RESOLUTION_UNSUPPORTED.into());
+        }
         self.ensure_unlocked(g).await?;
         self.capture_frame(g, region).await.map(|frame| frame.image)
     }
@@ -327,7 +355,15 @@ impl Daemon {
     ) -> Result<CapturedFrame, String> {
         let fetching = StepTimer::new("screenshot_fetch");
         let wda_frame = match self.wda(g) {
-            Some(w) => w.screenshot_png().await.map_err(|error| error.to_string()),
+            Some(w) => {
+                // 区域放大从原始像素裁剪（docs/architecture.md §5）：不用缩小、压缩过的 MJPEG 帧
+                let frame =
+                    if region.is_some() { w.screenshot_full_resolution().await } else { w.screenshot_png().await };
+                if let Err(e) = &frame {
+                    self.note_wda_error(g, e);
+                }
+                frame.map_err(|error| error.to_string())
+            }
             None => Err(wda_down(&g.state, g.info.as_ref())),
         };
         fetching.finish(wda_frame.is_ok());
@@ -354,10 +390,16 @@ impl Daemon {
         // 截图横竖和最近问到的方向一致就不再问 `/orientation`（动作刚做完时这一问要等界面静止，0.3–1.5 秒）
         let frame = imaging::frame_size(&png);
         let view = match self.wda(g) {
-            Some(w) => match frame {
-                Some((width, height)) => w.view_for_frame(width > height).await.ok(),
-                None => w.view().await.ok(),
-            },
+            Some(w) => {
+                let view = match frame {
+                    Some((width, height)) => w.view_for_frame(width > height).await,
+                    None => w.view().await,
+                };
+                if let Err(e) = &view {
+                    self.note_wda_error(g, e);
+                }
+                view.ok()
+            }
             None => None,
         };
         let screen = match view {
@@ -426,6 +468,9 @@ impl Daemon {
                 let fetching = StepTimer::new("screenshot_fetch");
                 let (frame, xml) = w.screenshot_with_source(budget).await;
                 fetching.finish(frame.is_ok());
+                if let Err(e) = &frame {
+                    self.note_wda_error(g, e);
+                }
                 source = Some(xml);
                 self.process_frame(g, None, frame.map_err(|error| error.to_string())).await
             }
@@ -564,8 +609,9 @@ impl Daemon {
         let w = self.require_wda(g)?;
         let mut prev: Option<Vec<u8>> = None;
         loop {
-            let png = w.screenshot_png().await.map_err(|e| e.to_string())?;
-            let cur = thumbnail(png).await?;
+            // MJPEG 帧（有就用）比整张 PNG 小得多，解码也快；只用来比画面动没动
+            let frame = w.motion_frame().await.map_err(|e| e.to_string())?;
+            let cur = thumbnail(frame).await?;
             if let Some(p) = &prev {
                 let m = imaging::thumb_motion(p, &cur);
                 if m.mean < VISUAL_STILL {
@@ -605,8 +651,8 @@ impl Daemon {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
-            let Ok(png) = w.screenshot_png().await else { return String::new() };
-            let Ok(t) = thumbnail(png).await else { return String::new() };
+            let Ok(frame) = w.motion_frame().await else { return String::new() };
+            let Ok(t) = thumbnail(frame).await else { return String::new() };
             thumbs.push(t);
         }
         let m = imaging::thumb_motion(&thumbs[0], &thumbs[1]);
@@ -639,8 +685,16 @@ impl Daemon {
         // 轮询时不等界面空闲：页面还在加载、播放动画时每次读树也只要约 0.2 秒
         w.begin_polling().await.map_err(|e| e.to_string())?;
         let r = async {
+            // 一次等待里方向不会变：只问一次，之后每轮只拉元素树
+            let view = w.view().await.map_err(|e| e.to_string())?;
             loop {
-                let els = w.elements().await.map_err(|e| e.to_string())?;
+                // 每轮 `/source` 最多等剩下的预算（不然一次就能等 60 秒，上限形同虚设）
+                let round = poll_round(t0, timeout);
+                let els = match w.tree_in_view_within(view, round).await {
+                    Ok(tree) => tree.elements,
+                    Err(WdaError::Timeout(_)) if t0.elapsed() >= timeout => Vec::new(),
+                    Err(e) => return Err(e.to_string()),
+                };
                 // 不算输入框里的字：刚输入的搜索词不能算「结果出来了」
                 if let Some(e) = elements::find_shown(&els, text).first() {
                     return Ok(ictl_l10n::trf!("已出现 {}({:.1} 秒)", "Appeared: {} ({:.1} s)", e.describe(), t0.elapsed().as_secs_f64()));
@@ -663,7 +717,7 @@ impl Daemon {
             // 只有连不上才退到 HID；超时说明请求已发出，再用 HID 做一遍可能点两次
             match w.tap(x, y).await {
                 Ok(()) => return Ok(ictl_l10n::trf!("已点击 {pos}", "Tapped {pos}")),
-                Err(WdaError::Unavailable(_)) => {}
+                Err(WdaError::Unavailable(_)) => self.trip_wda_breaker(g),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -770,7 +824,7 @@ impl Daemon {
                     g.settled_tree = settled.map(|tree| (Instant::now(), tree));
                     return Ok(ictl_l10n::trf!("已滑动 {desc}{}", "Swiped {desc}{}", note));
                 }
-                Err(WdaError::Unavailable(_)) => {}
+                Err(WdaError::Unavailable(_)) => self.trip_wda_breaker(g),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -832,7 +886,7 @@ impl Daemon {
                         if submit { ictl_l10n::tr!(",并按了回车", " and pressed Return") } else { "" }
                     ));
                 }
-                Err(WdaError::Unavailable(_)) => {}
+                Err(WdaError::Unavailable(_)) => self.trip_wda_breaker(g),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -879,7 +933,7 @@ impl Daemon {
             };
             match r {
                 Ok(text) => return Ok(text),
-                Err(WdaError::Unavailable(_)) => {}
+                Err(WdaError::Unavailable(_)) => self.trip_wda_breaker(g),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -890,7 +944,14 @@ impl Daemon {
     async fn lock_screen(&self, g: &mut Inner) -> Result<String, String> {
         if let Some(w) = self.wda(g) {
             // 已经锁着就不按：熄屏时再按电源键会把屏幕点亮
-            let locked = matches!(w.locked().await, Ok(true)) || lock_by_power_hid(w).await || {
+            let already = w.locked().await;
+            if let Err(e @ WdaError::Unavailable(_)) = &already {
+                // 连不上：后面几个 WDA 请求也连不上（每个最长要等 10 秒），直接走 HID
+                tracing::info!("查锁屏连不上 WDA，改用 HID 锁屏：{e}");
+                self.trip_wda_breaker(g);
+                return self.lock_by_hid(g).await;
+            }
+            let locked = matches!(already, Ok(true)) || lock_by_power_hid(w).await || {
                 // WDA 锁屏偶尔等 5 秒报 500（手机其实已锁）：确认锁了就不退到 HID（HID 会开屏幕媒体流）
                 match w.lock().await {
                     Ok(()) => true,
@@ -906,6 +967,10 @@ impl Daemon {
                 return Ok(ictl_l10n::tr!("已锁屏", "Locked").into());
             }
         }
+        self.lock_by_hid(g).await
+    }
+
+    async fn lock_by_hid(&self, g: &mut Inner) -> Result<String, String> {
         self.hid_do(g, |h| Box::pin(h.press(Button::Lock))).await?;
         g.last_lock = Some(Instant::now());
         g.unlocked_at = None;
@@ -1002,7 +1067,7 @@ impl Daemon {
 }
 
 /// 只给 WDA 短暂掉线留窗口。缓存不能跨进程重启、跨设备或长期代替方向查询。
-const HID_ROTATION_MAX_AGE: Duration = Duration::from_secs(30);
+pub(crate) const HID_ROTATION_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// 当前截图必须能确定横竖；横屏还需近期 WDA 旋转角。仅凭宽高无法识别 WDA 离线期间的 180° 翻转，
 /// 所以后备操作期间不要翻转设备；恢复 WDA 后重新确认方向。
@@ -1026,7 +1091,7 @@ pub(crate) fn hid_rotation(w: u32, h: u32, known: Option<(Duration, Rotation)>) 
 /// 按 Home，等主屏真的到前台再说「已按」（紧接着查状态时前台不再是旧 App）。
 /// 先经 IOHID 按（XCTest 的 home 在 iPhone 12 mini / iOS 26.4.1 上不起作用却报成功），
 /// [`HOME_SETTLE`] 内没回到主屏再用 XCTest 的 home 补一次；IOHID 这一下报错也改用 XCTest 的
-async fn press_home(w: &mut WdaClient<DeviceTransport>) -> Result<String, WdaError> {
+async fn press_home(w: &mut Wda) -> Result<String, WdaError> {
     let mut app = String::new();
     for via_hid in [true, false] {
         let sent = if via_hid { w.press_home_hid().await } else { w.press_button("home").await };
@@ -1062,7 +1127,7 @@ async fn press_home(w: &mut WdaClient<DeviceTransport>) -> Result<String, WdaErr
 
 /// 经 IOHID 按电源键锁屏，等 WDA 报锁屏，最多 [`LOCK_WAIT`]。锁上了返回 true。
 /// WDA 的 `/wda/lock` 在 iOS 27 以下用 XCTest 的 `pressLockButton`，iPhone 12 mini（iOS 26.4.1）上锁不了屏
-async fn lock_by_power_hid(w: &mut WdaClient<DeviceTransport>) -> bool {
+async fn lock_by_power_hid(w: &mut Wda) -> bool {
     if let Err(e) = w.press_power_hid().await {
         tracing::info!("经 IOHID 按电源键报错：{e}");
         return false;
@@ -1089,10 +1154,7 @@ fn middle_is_empty(tree: &Tree, screen_h: f64) -> bool {
 /// 滑动后等列表停下（最多 [`SCROLL_SETTLE`]）：沿滑动方向的位置连续两次差不超过 [`STILL_TOLERANCE`]。
 /// 没停下返回提醒；元素很少（游戏、地图）看不出来，不等
 /// 返回结果说明，以及停稳时的元素树（没停稳或读失败时为 None）
-async fn wait_scrolled(
-    w: &mut WdaClient<DeviceTransport>,
-    vertical: bool,
-) -> (String, Option<ictl_wda::elements::Tree>) {
+async fn wait_scrolled(w: &mut Wda, vertical: bool) -> (String, Option<ictl_wda::elements::Tree>) {
     if w.begin_polling().await.is_err() {
         return (String::new(), None);
     }
@@ -1133,13 +1195,12 @@ async fn wait_scrolled(
 
 /// 轮询元素树直到连续两次一样（位置差不超过 [`STILL_TOLERANCE`]，且没有加载圈）或到 `max`。返回第一次读到的树，以及 (结果说明, 最后的树)；
 /// 第一次读到的元素很少（游戏、地图）时第二项是 None，由调用方改看画面。
-/// 不中途丢弃请求：丢掉的请求手机上仍在执行，后面的请求要排在它后面
-async fn poll_stable(
-    w: &mut WdaClient<DeviceTransport>,
-    t0: Instant,
-    max: Duration,
-) -> Result<(Tree, Option<(String, Tree)>), String> {
-    let first = w.tree().await.map_err(|e| e.to_string())?;
+/// 每轮 `/source` 最多等剩下的时间（至少 [`MIN_POLL_ROUND`]）：一次读树可能要等很久，不限的话上限形同虚设。
+/// 超时丢掉的只是读请求，不会改变界面
+async fn poll_stable(w: &mut Wda, t0: Instant, max: Duration) -> Result<(Tree, Option<(String, Tree)>), String> {
+    // 等稳定期间方向不会变：只问一次
+    let view = w.view().await.map_err(|e| e.to_string())?;
+    let first = w.tree_in_view_within(view, poll_round(t0, max)).await.map_err(|e| e.to_string())?;
     if first.elements.len() < VISUAL_SETTLE_BELOW {
         return Ok((first, None));
     }
@@ -1162,7 +1223,12 @@ async fn poll_stable(
         }
         // 一次读树本身约 0.2 秒，两次之间不用再多等
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let cur = w.tree().await.map_err(|e| e.to_string())?;
+        let cur = match w.tree_in_view_within(view, poll_round(t0, max)).await {
+            Ok(cur) => cur,
+            // 这一轮读到上限了：按上一次读到的返回（下一圈循环报「一直在变」）
+            Err(WdaError::Timeout(_)) if t0.elapsed() >= max => continue,
+            Err(e) => return Err(e.to_string()),
+        };
         let same = cur.close_to(&prev, STILL_TOLERANCE);
         prev = cur;
         if same && !prev.loading {
@@ -1170,6 +1236,14 @@ async fn poll_stable(
         }
     };
     Ok((first, Some((msg, prev))))
+}
+
+/// 轮询时每轮读树至少给这么久（预算刚好用完时也能读完一次）
+const MIN_POLL_ROUND: Duration = Duration::from_secs(1);
+
+/// 这一轮读树最多等多久：剩下的预算，至少 [`MIN_POLL_ROUND`]
+fn poll_round(t0: Instant, budget: Duration) -> Duration {
+    budget.saturating_sub(t0.elapsed()).max(MIN_POLL_ROUND)
 }
 
 /// 判断画面动没动用的缩略图。解码是 CPU 活，放到阻塞线程
@@ -1269,7 +1343,7 @@ fn typed_prefix(values: &[String], text: &str) -> Option<usize> {
         .max()
 }
 
-async fn verify_typed(w: &mut WdaClient<DeviceTransport>, text: &str) -> Typed {
+async fn verify_typed(w: &mut Wda, text: &str) -> Typed {
     if squash(text).is_empty() {
         return Typed::Unknown;
     }
@@ -1351,6 +1425,138 @@ mod tests {
         let error = daemon.hid_touch_rotation(&mut inner).await.unwrap_err();
         assert!(error.contains("bounded remote capture"), "{error}");
         assert!(inner.tunnel.is_none());
+    }
+
+    use crate::testkit;
+    use ictl_wda::fake::Reply;
+
+    /// 安全规则（回归用例 #29）：只有连不上（Unavailable）才退到 HID；连不上之后同一请求不再碰 WDA
+    #[tokio::test]
+    async fn unavailable_tap_and_swipe_fall_back_to_hid_without_touching_wda_again() {
+        let (d, dir) = testkit::daemon("tap-unavailable");
+        for swipe in [false, true] {
+            let fake = testkit::healthy_wda();
+            fake.on("POST", "/actions", Reply::unavailable());
+            let mut g = d.inner.lock().await;
+            testkit::attach(&mut g, &fake);
+            g.wda_unreachable_until = None;
+            let r = if swipe {
+                d.swipe(&mut g, (10.0, 10.0), (10.0, 200.0), 0.3).await
+            } else {
+                d.tap(&mut g, 10.0, 20.0).await
+            };
+            // 没接手机：HID 路线报「没有发送触摸」，说明确实退到了 HID
+            let e = r.unwrap_err();
+            assert!(e.contains("HID") && e.contains("没有发送触摸"), "{e}");
+            assert_eq!(fake.count("POST", "/actions"), 1);
+            let after = fake.requests().into_iter().skip_while(|(_, p)| p != "/actions").skip(1).collect::<Vec<_>>();
+            assert!(after.is_empty(), "WDA touched after it was unreachable: {after:?}");
+            assert!(g.wda_unreachable_until.is_some());
+            assert!(d.wda(&mut g).is_none());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 安全规则：请求已发出后的超时、中途断开不退到 HID、不重做，原样报错
+    #[tokio::test]
+    async fn timed_out_or_interrupted_actions_are_never_redone() {
+        let (d, dir) = testkit::daemon("tap-timeout");
+        for (reply, word) in [(Reply::timeout(), "超时"), (Reply::interrupted(), "断开")] {
+            for swipe in [false, true] {
+                let fake = testkit::healthy_wda();
+                fake.on("POST", "/actions", reply.clone());
+                let mut g = d.inner.lock().await;
+                testkit::attach(&mut g, &fake);
+                let r = if swipe {
+                    d.swipe(&mut g, (10.0, 10.0), (10.0, 200.0), 0.3).await
+                } else {
+                    d.tap(&mut g, 10.0, 20.0).await
+                };
+                let e = r.unwrap_err();
+                assert!(e.contains(word) && !e.contains("HID"), "{e}");
+                assert_eq!(fake.count("POST", "/actions"), 1, "the action must not be sent twice");
+                assert!(g.tunnel.is_none() && g.hid_used.is_none(), "no HID session for a sent action");
+                assert!(g.wda_unreachable_until.is_none());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 回归：WDA 连不上时不能记成「确认没锁」，否则之后 20 秒的 HID 操作都不检查锁屏
+    #[tokio::test]
+    async fn unreachable_lock_check_is_not_a_confirmed_unlock() {
+        let (d, dir) = testkit::daemon("unlock-unknown");
+        let fake = testkit::healthy_wda();
+        fake.on("GET", "/wda/locked", Reply::unavailable());
+        let mut g = d.inner.lock().await;
+        testkit::attach(&mut g, &fake);
+        d.ensure_unlocked(&mut g).await.unwrap();
+        assert!(g.unlocked_at.is_none());
+        // 断路：接下来的点击不再碰 WDA，直接走 HID
+        let e = d.tap(&mut g, 1.0, 2.0).await.unwrap_err();
+        assert!(e.contains("HID"), "{e}");
+        assert_eq!(fake.count("POST", "/actions"), 0);
+        // 能连上、确认没锁时才记下
+        drop(g);
+        let fake = testkit::healthy_wda();
+        let mut g = d.inner.lock().await;
+        testkit::attach(&mut g, &fake);
+        g.wda_unreachable_until = None;
+        d.ensure_unlocked(&mut g).await.unwrap();
+        assert!(g.unlocked_at.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 有界截图策略下区域放大直接报不支持，不拿 MJPEG 帧去裁
+    #[tokio::test]
+    async fn region_zoom_is_refused_under_the_bounded_policy() {
+        let dir = std::env::temp_dir().join(format!("ictl-bounded-region-{}", std::process::id()));
+        let mut cfg = crate::config::Config::from_env(&dir);
+        cfg.capture_policy = CapturePolicy::BoundedRemote;
+        let d = Daemon::new(cfg);
+        let fake = testkit::healthy_wda();
+        let mut g = d.inner.lock().await;
+        testkit::attach(&mut g, &fake);
+        let e = d.screenshot(&mut g, Some((0.0, 0.0, 100.0, 100.0))).await.unwrap_err();
+        assert!(e.contains("full-resolution"), "{e}");
+        assert!(fake.requests().is_empty());
+    }
+
+    /// 等元素出现：方向只问一次；每轮读树按剩下的预算限时，超过上限就报没出现
+    #[tokio::test]
+    async fn wait_for_bounds_each_round_by_the_remaining_budget() {
+        let (d, dir) = testkit::daemon("wait-for");
+        let fake = testkit::healthy_wda();
+        fake.on("GET", "/source", Reply::Hang);
+        let mut g = d.inner.lock().await;
+        testkit::attach(&mut g, &fake);
+        g.unlocked_at = Some(Instant::now());
+        let t0 = Instant::now();
+        let e = d.wait_for(&mut g, "x", Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("没出现"), "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert!(fake.count("GET", "/orientation") <= 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn poll_rounds_use_the_remaining_budget_with_a_floor() {
+        let t0 = Instant::now();
+        assert!(poll_round(t0, Duration::from_secs(30)) > Duration::from_secs(29));
+        assert_eq!(poll_round(t0 - Duration::from_secs(40), Duration::from_secs(30)), MIN_POLL_ROUND);
+    }
+
+    /// HID 触摸前核对横竖：2 秒内截过 HID 图就用它的宽高，不再截一整张
+    #[tokio::test]
+    async fn hid_orientation_check_reuses_a_recent_frame_size() {
+        let (d, dir) = testkit::daemon("hid-frame");
+        let mut g = d.inner.lock().await;
+        g.hid_frame = Some((Instant::now(), (1290, 2796)));
+        assert_eq!(d.hid_touch_rotation(&mut g).await, Ok(Rotation::Portrait));
+        g.hid_frame = Some((Instant::now() - HID_FRAME_REUSE, (1290, 2796)));
+        // 旧了：要重新截图（没接手机，截不了）
+        assert!(d.hid_touch_rotation(&mut g).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

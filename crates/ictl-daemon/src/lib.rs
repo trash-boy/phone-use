@@ -14,6 +14,8 @@ pub mod imaging;
 pub mod machine;
 pub mod notify;
 mod supervise;
+#[cfg(test)]
+mod testkit;
 mod tools;
 mod wda_pkg;
 

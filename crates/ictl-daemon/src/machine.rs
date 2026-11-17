@@ -158,6 +158,37 @@ impl Misses {
     }
 }
 
+/// 本进程的 runner 还活着、`/status` 却一直连不上（连接建立前就失败）多久，才算手机上的 WDA 卡死、要重启。
+/// 短暂连不上（usbmuxd 抖一下、USB 链路忙）按 [`Misses`] 的规则不算数；但宿主侧 runner 活着、手机上的 HTTP 服务
+/// 一直不通时，只看 [`Misses`] 永远不会重启，状态也一直是就绪
+pub const LINK_DOWN_RESTART: Duration = Duration::from_secs(150);
+
+/// 连续连不上 WDA 的起点（见 [`LINK_DOWN_RESTART`]）。任何一次连上了（不管 WDA 怎么答）都清掉
+#[derive(Debug, Default)]
+pub struct LinkDown {
+    since: Option<Instant>,
+}
+
+impl LinkDown {
+    /// 记一次探测：`unreachable` 是这次连不上。返回 true 表示连不上已经持续够久，该重启 WDA 了
+    pub fn observe(&mut self, now: Instant, unreachable: bool) -> bool {
+        if !unreachable {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= LINK_DOWN_RESTART
+    }
+
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        self.since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+
+    pub fn reset(&mut self) {
+        self.since = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +286,25 @@ mod tests {
         assert!(!m.hit(now + Duration::from_secs(61)));
         assert!(!m.hit(now + Duration::from_secs(121)), "also require at least three failures");
         assert!(m.hit(now + Duration::from_secs(122)));
+    }
+
+    /// 短暂连不上不算；连不上持续超过 LINK_DOWN_RESTART 才重启；中间连上过一次就重新计时
+    #[test]
+    fn sustained_link_failure_restarts_but_brief_blips_do_not() {
+        let t = Instant::now();
+        let mut l = LinkDown::default();
+        for s in [0, 10, 60, 140] {
+            assert!(!l.observe(t + Duration::from_secs(s), true), "{s}s");
+        }
+        assert!(l.observe(t + LINK_DOWN_RESTART, true));
+        assert_eq!(l.elapsed(t + LINK_DOWN_RESTART), LINK_DOWN_RESTART);
+        // 连上了一次（哪怕 WDA 答得不对）：重新计时
+        assert!(!l.observe(t + Duration::from_secs(160), false));
+        assert!(!l.observe(t + Duration::from_secs(170), true));
+        assert!(!l.observe(t + Duration::from_secs(170) + LINK_DOWN_RESTART - Duration::from_secs(1), true));
+        assert!(l.observe(t + Duration::from_secs(170) + LINK_DOWN_RESTART, true));
+        l.reset();
+        assert_eq!(l.elapsed(t), Duration::ZERO);
     }
 
     #[test]

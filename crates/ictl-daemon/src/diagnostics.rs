@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) use ictl_wda::diagnostics::lock_unpoisoned as lock;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthProbe {
     pub sequence: u64,
@@ -111,14 +113,14 @@ impl Diagnostics {
         s
     }
     pub fn active(shared: &Arc<Mutex<Self>>, operation_id: u64, tool: String) -> OperationGuard {
-        shared.lock().unwrap().active = Some(ActiveOperation { operation_id, tool });
+        lock(shared).active = Some(ActiveOperation { operation_id, tool });
         OperationGuard(shared.clone())
     }
 }
 pub(crate) struct OperationGuard(Arc<Mutex<Diagnostics>>);
 impl Drop for OperationGuard {
     fn drop(&mut self) {
-        self.0.lock().unwrap().active = None;
+        lock(&self.0).active = None;
     }
 }
 fn unix_ms() -> u64 {

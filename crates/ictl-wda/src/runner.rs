@@ -126,11 +126,11 @@ struct ErrorListener(Arc<Mutex<Progress>>);
 
 impl ErrorListener {
     fn push(&self, s: &str) {
-        self.0.lock().unwrap().errors.push(s.to_owned());
+        crate::diagnostics::lock_unpoisoned(&self.0).errors.push(s.to_owned());
     }
 
     fn event(&self, event: &'static str) {
-        let mut p = self.0.lock().unwrap();
+        let mut p = crate::diagnostics::lock_unpoisoned(&self.0);
         p.event_seq += 1;
         let sequence = p.diagnostics.as_ref().map_or(p.event_seq, RunnerDiagnostics::next_sequence);
         let phone_pid = p.diagnostics.as_ref().and_then(|d| d.snapshot().phone_pid);
@@ -159,7 +159,7 @@ impl ErrorListener {
 // 生命周期以固定字段记录到 INFO；原始手机消息只留在 DEBUG。
 impl XCUITestListener for ErrorListener {
     async fn log_message(&mut self, message: &str) -> std::result::Result<(), IdeviceError> {
-        self.0.lock().unwrap().log_messages += 1;
+        crate::diagnostics::lock_unpoisoned(&self.0).log_messages += 1;
         tracing::debug!("xctest log: {message}");
         Ok(())
     }
@@ -168,7 +168,7 @@ impl XCUITestListener for ErrorListener {
         tracing::debug!("xctest debug: {message}");
         let signal = automation_signal(message);
         {
-            let mut p = self.0.lock().unwrap();
+            let mut p = crate::diagnostics::lock_unpoisoned(&self.0);
             p.debug_messages += 1;
             match signal {
                 Some(AutomationSignal::Waiting) => p.automation_wait = Some(tokio::time::Instant::now()),
@@ -203,7 +203,7 @@ impl XCUITestListener for ErrorListener {
 
     async fn did_begin_executing_test_plan(&mut self) -> std::result::Result<(), IdeviceError> {
         self.event("xctest_plan_started");
-        self.0.lock().unwrap().plan_started = true;
+        crate::diagnostics::lock_unpoisoned(&self.0).plan_started = true;
         Ok(())
     }
 
@@ -220,7 +220,7 @@ impl XCUITestListener for ErrorListener {
         self.event("xctest_bundle_protocol_ready");
         tracing::info!(
             event = "xctest_protocol_version",
-            runner_id = self.0.lock().unwrap().runner_id,
+            runner_id = crate::diagnostics::lock_unpoisoned(&self.0).runner_id,
             version,
             minimum
         );
@@ -316,8 +316,13 @@ impl WdaRunner {
                     Ok(()) => "test plan completed".to_owned(),
                     Err(e) => e.to_string(),
                 };
-                progress.lock().unwrap().exit_reason = Some(reason.clone());
-                emit_exit_summary(&progress.lock().unwrap(), &diagnostics, started.elapsed(), category);
+                crate::diagnostics::lock_unpoisoned(&progress).exit_reason = Some(reason.clone());
+                emit_exit_summary(
+                    &crate::diagnostics::lock_unpoisoned(&progress),
+                    &diagnostics,
+                    started.elapsed(),
+                    category,
+                );
                 result
             };
             tokio::spawn(run.instrument(span))
@@ -327,7 +332,7 @@ impl WdaRunner {
         let client = WdaClient::new(DeviceTransport::new(provider, WDA_PORT));
 
         let failure = |extra: Option<String>| {
-            let p = progress.lock().unwrap();
+            let p = crate::diagnostics::lock_unpoisoned(&progress);
             let mut text = p.errors.clone();
             text.extend(extra);
             let joined = text.join("; ");
@@ -345,7 +350,7 @@ impl WdaRunner {
         let mut fallback_logged = false;
         loop {
             // runner 在等手机上输密码：等满它自己的 60 秒，期间输了密码就能直接就绪
-            if let Some(since) = progress.lock().unwrap().automation_wait {
+            if let Some(since) = crate::diagnostics::lock_unpoisoned(&progress).automation_wait {
                 deadline = deadline.max(since + AUTOMATION_WAIT);
                 if !announced {
                     announced = true;
@@ -361,7 +366,7 @@ impl WdaRunner {
                 };
                 return Err(failure(Some(msg)));
             }
-            let plan_started = progress.lock().unwrap().plan_started;
+            let plan_started = crate::diagnostics::lock_unpoisoned(&progress).plan_started;
             if !plan_started && t0.elapsed() >= PLAN_START_FALLBACK && !fallback_logged {
                 fallback_logged = true;
                 tracing::info!(
@@ -385,13 +390,26 @@ impl WdaRunner {
         }
     }
 
+    /// 单测用：一个一直活着的 runner（不连设备），配合 [`crate::fake`] 的假传输
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fake_alive() -> Self {
+        let diagnostics = Self::diagnostic_session();
+        Self {
+            task: tokio::spawn(std::future::pending()),
+            progress: Arc::new(Mutex::new(Progress::default())),
+            started: std::time::Instant::now(),
+            diagnostics,
+            ready: true,
+        }
+    }
+
     /// runner 任务是否还活着。死了就算手机上的 WDA 还在响应也不能用
     pub fn alive(&self) -> bool {
         !self.task.is_finished()
     }
 
     pub fn exit_reason(&self) -> Option<String> {
-        self.progress.lock().unwrap().exit_reason.clone()
+        crate::diagnostics::lock_unpoisoned(&self.progress).exit_reason.clone()
     }
 
     /// 停掉 runner（即丢掉它，见 Drop）
