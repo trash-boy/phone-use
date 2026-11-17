@@ -19,6 +19,9 @@ Restart=on-failure
 RestartSec=10
 # 停止时先停 HID 屏幕媒体流和 runner，给够时间，避免手机端留下会话
 TimeoutStopSec=30
+# 用户服务里可用的加固。PrivateTmp/ProtectSystem 在用户服务里要靠非特权用户命名空间（隐含 PrivateUsers=），
+# 很多主机限制了它（如 Ubuntu 的 AppArmor），会导致服务起不来，所以不加；MemoryMax 不设，截图内存视设备而定
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
