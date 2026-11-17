@@ -18,6 +18,7 @@ All notable changes to this project are documented here. The format is based on 
 - A temporarily full browser relay queue no longer disconnects the entire iPhone session when closing a stream. Transport diagnostics now expose stream lifecycle, close delivery, USB window stalls and underlying device IO errors.
 
 - Scroll bars are dropped from element lists in every system language, not only Chinese and English: they are recognised by their percentage value and thin shape instead of their label. On a German iPhone, for example, lines like `Other "Vertikaler Rollbalken, 1 Seite"` no longer appear.
+- Element positions inside a WebView that sits below a navigation bar (an app's in-app browser) are no longer shifted down by the WebView's y (about 100 pt), so tapping by text hits the element instead of the row below it.
 
 ## [0.1.4] - 2026-11-07
 
