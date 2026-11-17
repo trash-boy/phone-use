@@ -2,7 +2,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 if [ -z "${RUST_GATEWAY_BIN:-}" ]; then
-    cargo "+${RUSTUP_TOOLCHAIN:-1.90.0}" build --locked --manifest-path ../Cargo.toml -p ictl-gateway --bin iphone-control-gateway
+    cargo build --locked --manifest-path ../Cargo.toml -p ictl-gateway --bin iphone-control-gateway
     task_target="${CARGO_TARGET_DIR:-../target}"
     RUST_GATEWAY_BIN="$(cd "$task_target/debug" && pwd)/iphone-control-gateway"
     export RUST_GATEWAY_BIN
