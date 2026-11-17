@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn SetupPanel(ui: Ui) -> impl IntoView {
     let line = RwSignal::new(String::new());
     let transcript = NodeRef::<leptos::html::Pre>::new();
-    let setup = move || ui.session()["setup"].clone();
+    let setup = move || ui.session.read()["setup"].clone();
     let running = move || setup()["state"] == "running";
     let transcript_text = Memo::new(move |_| string(&setup(), "transcript"));
     Effect::new(move |_| {

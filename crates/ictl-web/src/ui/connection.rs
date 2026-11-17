@@ -40,9 +40,9 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
     let supported = truth(&get(&global(), "isSecureContext")) && truth(&get(&get(&global(), "navigator"), "usb"));
     let selected = move || {
         if ui.occupied() {
-            ui.session()["platform"]
+            ui.session.read()["platform"]
                 .as_str()
-                .or(ui.state.get()["device"]["platform"].as_str())
+                .or(ui.state.read()["device"]["platform"].as_str())
                 .unwrap_or(&platform.get())
                 .to_string()
         } else {
@@ -78,7 +78,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                 <div>
                     <strong>
                         {move || {
-                            let name = string(&ui.state.get()["device"], "productName");
+                            let name = ui.state.with(|s| string(&s["device"], "productName"));
                             if name.is_empty() {
                                 if selected() == "android" {
                                     "你的 Android 手机".into()
@@ -101,9 +101,9 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                     </span>
                 </div>
             </div>
-            <Show when=move || !string(&ui.state.get()["device"], "serialNumber").is_empty()>
+            <Show when=move || !ui.state.with(|s| string(&s["device"], "serialNumber")).is_empty()>
                 <code class="device-id">
-                    {move || string(&ui.state.get()["device"], "serialNumber")}
+                    {move || ui.state.with(|s| string(&s["device"], "serialNumber"))}
                 </code>
             </Show>
             <label class="field-label" for="server-url">
@@ -140,7 +140,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                         <button
                             class="button primary full"
                             aria-label=move || {
-                                if ui.state.get()["cleanupPending"] == true {
+                                if ui.state.read()["cleanupPending"] == true {
                                     "等待 USB 释放"
                                 } else if selected() == "android" {
                                     "连接 Android"
@@ -149,7 +149,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                                 }
                             }
                             disabled=move || {
-                                !supported || ui.state.get()["cleanupPending"] == true
+                                !supported || ui.state.read()["cleanupPending"] == true
                                     || token.get().trim().is_empty()
                             }
                             on:click=move |_| {
@@ -161,7 +161,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                             <Icon name="plug" />
                             " "
                             {move || {
-                                if ui.state.get()["cleanupPending"] == true {
+                                if ui.state.read()["cleanupPending"] == true {
                                     "等待 USB 释放"
                                 } else if selected() == "android" {
                                     "连接 Android"
@@ -175,7 +175,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
             >
                 <button class="button secondary full" on:click=move |_| ui.disconnect()>
                     {move || {
-                        if ui.state.get()["phase"] == "connected" {
+                        if ui.state.read()["phase"] == "connected" {
                             "断开连接"
                         } else {
                             "取消连接"
@@ -183,9 +183,9 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                     }}
                 </button>
             </Show>
-            <Show when=move || !string(&ui.state.get(), "warning").is_empty()>
+            <Show when=move || !ui.state.with(|s| string(s, "warning")).is_empty()>
                 <p class="field-hint" role="status">
-                    {move || string(&ui.state.get(), "warning")}
+                    {move || ui.state.with(|s| string(s, "warning"))}
                 </p>
             </Show>
             {(!supported)
@@ -200,7 +200,7 @@ pub(super) fn ConnectionPanel(ui: Ui) -> impl IntoView {
                 <span class="tiny-dot" />
                 " "
                 {move || {
-                    let status = string(&ui.state.get(), "transportStatus");
+                    let status = ui.state.with(|s| string(s, "transportStatus"));
                     if ui.occupied() && !status.is_empty() {
                         status
                     } else {

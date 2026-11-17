@@ -6,6 +6,8 @@ use js_sys::{Array, Promise};
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+/// The synchronous result of calling `fetch`: the response promise or a thrown error.
+type PendingFetch = Result<JsValue, JsValue>;
 #[derive(Default)]
 struct Attempt {
     id: u64,
@@ -255,6 +257,32 @@ impl BrowserClient {
     pub fn screen(&self) -> Promise {
         self.session_promise("/preview", "GET", JsValue::UNDEFINED)
     }
+    /// Fetch the latest captured screen as JPEG bytes and return an object URL
+    /// (the caller revokes it). Rejects with `status` set when the gateway has no
+    /// `screen.jpg` route (older gateways) or the response is not an image.
+    #[wasm_bindgen(js_name=screenImage)]
+    pub fn screen_image(&self) -> Promise {
+        let (_, response) = match self.session_fetch("/screen.jpg", "GET", JsValue::UNDEFINED) {
+            Ok(started) => started,
+            Err(e) => return Promise::reject(&e),
+        };
+        future_to_promise(async move {
+            let response = resolved(response?).await?;
+            let status = get(&response, "status");
+            let kind = call(&get(&response, "headers"), "get", &["Content-Type".into()])
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            if !truth(&get(&response, "ok")) || !kind.to_ascii_lowercase().starts_with("image/") {
+                let e = error(format!("屏幕图片不可用（{}）", status.as_f64().unwrap_or(0.0)));
+                set(&e, "status", &status);
+                set(&e, "unsupported", &(truth(&get(&response, "ok")) || number(&response, "status") == 404.0).into());
+                return Err(e);
+            }
+            let blob = invoke(&response, "blob", &[]).await?;
+            call(&get(&global(), "URL"), "createObjectURL", &[blob])
+        })
+    }
     #[wasm_bindgen(js_name=stopPreview)]
     pub fn stop_preview(&self) -> Promise {
         let attempt = self.inner.borrow().attempt.clone();
@@ -474,16 +502,22 @@ impl BrowserClient {
         }
         Ok(value)
     }
-    fn session_promise(&self, route: &str, method: &str, data: JsValue) -> Promise {
+    /// Start an authenticated request for a route of the current session.
+    fn session_fetch(
+        &self,
+        route: &str,
+        method: &str,
+        data: JsValue,
+    ) -> Result<(Rc<RefCell<Attempt>>, PendingFetch), JsValue> {
         let Some(a) = self.inner.borrow().attempt.clone() else {
-            return Promise::reject(&error("请先连接手机"));
+            return Err(error("请先连接手机"));
         };
         let (base, session, cancelled) = {
             let a = a.borrow();
             (a.base.clone(), a.session.clone(), a.cancelled)
         };
         if cancelled || !truth(&session) {
-            return Promise::reject(&error("请先连接手机"));
+            return Err(error("请先连接手机"));
         }
         let token = text(&session, "token");
         let headers = obj(&[("Authorization", format!("Bearer {token}").into())]);
@@ -499,7 +533,13 @@ impl BrowserClient {
         }
         let url = format!("{base}/api/sessions/{}{route}", text(&session, "id"));
         let fetch = self.inner.borrow().fetch.clone();
-        let response = apply(&fetch, &global(), &[url.into(), options]);
+        Ok((a, apply(&fetch, &global(), &[url.into(), options])))
+    }
+    fn session_promise(&self, route: &str, method: &str, data: JsValue) -> Promise {
+        let (a, response) = match self.session_fetch(route, method, data) {
+            Ok(started) => started,
+            Err(e) => return Promise::reject(&e),
+        };
         let this = self.clone();
         future_to_promise(async move {
             let result = async {

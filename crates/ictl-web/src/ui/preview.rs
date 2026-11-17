@@ -9,7 +9,7 @@ fn pointer(event: &PointerEvent, ui: Ui) -> Option<Pointer> {
     let (mut width, mut height) = (image.natural_width() as f64, image.natural_height() as f64);
     // MJPEG frames are scaled pixels, not phone points: map with the device screen size.
     if !ui.preview_url.get_untracked().is_empty() {
-        let session = ui.session();
+        let session = ui.session.read();
         let screen = &session["daemon"]["persisted"]["screen"];
         let (w, h) = (screen["width"].as_f64()?, screen["height"].as_f64()?);
         (width, height) = if width > height { (h.max(w), h.min(w)) } else { (h.min(w), h.max(w)) };
@@ -35,7 +35,7 @@ fn stop_live(ui: Ui) {
     });
 }
 fn start_live(ui: Ui, live_error: RwSignal<String>) {
-    let session_id = string(&ui.session(), "id");
+    let session_id = ui.session.with(|s| string(s, "id"));
     live_error.set(String::new());
     let pending = ui.client.get_value().preview_stream();
     spawn_local(async move {
@@ -57,13 +57,13 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
     let stream_started = StoredValue::new_local((String::new(), 0.0));
     let image_ref = NodeRef::<leptos::html::Img>::new();
     let live = move || !ui.preview_url.get().is_empty();
-    let live_fresh = move || ui.session()["preview"]["ageMs"].as_u64().is_some_and(|age| age <= LIVE_STALE_MS);
+    let live_fresh = move || ui.session.read()["preview"]["ageMs"].as_u64().is_some_and(|age| age <= LIVE_STALE_MS);
     // Chrome only emits load for the first MJPEG image: poll intrinsic dimensions with
     // session status so later rotations update the layout. A multipart response can stay
     // open across upstream retries without an error event, so a stream without frames for
     // 5 s is released (transport protection may have paused it) and one screenshot replaces it.
     Effect::new(move |_| {
-        let _ = ui.state.get();
+        ui.state.track();
         let stream = ui.preview_url.get();
         if stream.is_empty() {
             stream_started.set_value((String::new(), 0.0));
@@ -131,12 +131,12 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                 <div class=move || {
                     format!(
                         "phone-frame {} {}",
-                        if ui.screen.get().is_null() && !live() { "" } else { "has-screen" },
+                        if ui.screen.with(Value::is_null) && !live() { "" } else { "has-screen" },
                         if landscape.get() { "wide" } else { "" },
                     )
                 }>
                     <Show
-                        when=move || !ui.screen.get().is_null() || live()
+                        when=move || !ui.screen_src.with(String::is_empty) || live()
                         fallback=move || {
                             view! {
                                 <div class="empty-phone">
@@ -166,10 +166,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                                 if !stream.is_empty() {
                                     return stream;
                                 }
-                                format!(
-                                    "data:image/jpeg;base64,{}",
-                                    string(&ui.screen.get(), "imageBase64"),
-                                )
+                                ui.screen_src.get()
                             }
                             alt="手机当前屏幕"
                             draggable="false"
@@ -232,14 +229,14 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
             <div class="screen-meta">
                 <span>
                     <i class=move || {
-                        format!("tiny-dot {}", if ui.screen.get().is_null() && !live() { "" } else { "live" })
+                        format!("tiny-dot {}", if ui.screen.with(Value::is_null) && !live() { "" } else { "live" })
                     } />
                     {move || {
                         if live() {
                             if live_fresh() { "实时画面" } else { "实时画面连接中" }
                         } else if ui.running() {
                             "任务最近一次观察"
-                        } else if ui.screen.get().is_null() {
+                        } else if ui.screen.with(Value::is_null) {
                             "按需截图"
                         } else {
                             "最近一次截图（非实时）"
@@ -250,8 +247,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                             return None;
                         }
                         ui.screen
-                            .get()["timings"]["screenshotMs"]
-                            .as_f64()
+                            .with(|s| s["timings"]["screenshotMs"].as_f64())
                             .filter(|ms| ms.is_finite())
                             .map(|ms| {
                                 view! {
@@ -357,7 +353,7 @@ pub(super) fn PhonePreview(ui: Ui) -> impl IntoView {
                     "请先点选手机上的输入框。中文输入通过粘贴完成，会覆盖手机剪贴板。"
                 </p>
             </Show>
-            <Show when=move || !string(&ui.screen.get(), "elementsError").is_empty()>
+            <Show when=move || ui.screen.with(|s| !string(s, "elementsError").is_empty())>
                 <p class="field-hint">"画面可用，界面元素暂时不可用。"</p>
             </Show>
         </section>

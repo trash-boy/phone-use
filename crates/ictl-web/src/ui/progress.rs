@@ -74,7 +74,7 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                         <button
                             class="button danger small"
                             disabled=move || {
-                                let s = ui.session();
+                                let s = ui.session.read();
                                 ui.stop_key.get()
                                     == format!("{}/{}", string(&s, "id"), string(&s["task"], "id"))
                             }
@@ -85,7 +85,7 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                     </Show>
                 </div>
                 <Show
-                    when=move || !ui.task().is_null()
+                    when=move || !ui.task.with(Value::is_null)
                     fallback=|| {
                         view! {
                             <div class="empty-progress">
@@ -100,27 +100,27 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                     }
                 >
                     <div
-                        class=move || format!("task-status {}", string(&ui.task(), "state"))
+                        class=move || format!("task-status {}", ui.task.with(|t| string(t, "state")))
                         role="status"
                     >
                         <span class="tiny-dot" />
-                        {move || state_label(&string(&ui.task(), "state"))}
+                        {move || state_label(&ui.task.with(|t| string(t, "state")))}
                         <span class="step-count">
                             {move || {
-                                format!("{} 步", ui.task()["steps"].as_array().map_or(0, Vec::len))
+                                format!("{} 步", ui.task.read()["steps"].as_array().map_or(0, Vec::len))
                             }}
                         </span>
                     </div>
-                    <p class="current-instruction">{move || string(&ui.task(), "instruction")}</p>
-                    <Show when=move || ui.task()["autoConfirm"] == true>
+                    <p class="current-instruction">{move || ui.task.with(|t| string(t, "instruction"))}</p>
+                    <Show when=move || ui.task.read()["autoConfirm"] == true>
                         <p class="field-hint">"已开启自动确认：除付款、购买外不再询问"</p>
                     </Show>
                     <Show when=move || {
-                        ui.task()["instructionUpdates"].as_array().is_some_and(|updates| !updates.is_empty())
+                        ui.task.read()["instructionUpdates"].as_array().is_some_and(|updates| !updates.is_empty())
                     }>
                         <ul class="field-hint" aria-label="目标修改记录">
                             {move || {
-                                ui.task()["instructionUpdates"]
+                                ui.task.read()["instructionUpdates"]
                                     .as_array()
                                     .cloned()
                                     .unwrap_or_default()
@@ -174,24 +174,24 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                             </div>
                         </form>
                     </Show>
-                    <Show when=move || !string(&ui.task(), "model").is_empty()>
+                    <Show when=move || !ui.task.with(|t| string(t, "model")).is_empty()>
                         <p class="field-hint">
                             {move || {
-                                format!("本次任务模型：{}", string(&ui.task(), "model"))
+                                format!("本次任务模型：{}", ui.task.with(|t| string(t, "model")))
                             }}
                         </p>
                     </Show>
-                    <Show when=move || !ui.task()["timings"].is_null()>
+                    <Show when=move || !ui.task.read()["timings"].is_null()>
                         <p class="card-description" aria-label="最近一轮耗时">
-                            {move || timing_text(&ui.task()["timings"])}
+                            {move || timing_text(&ui.task.read()["timings"])}
                         </p>
                     </Show>
-                    <Show when=move || ui.task()["plan"].as_array().is_some_and(|plan| !plan.is_empty())>
+                    <Show when=move || ui.task.read()["plan"].as_array().is_some_and(|plan| !plan.is_empty())>
                         <p class="field-hint" aria-label="已规划的后续步骤">
                             {move || {
                                 format!(
                                     "已规划、待执行：{}",
-                                    ui.task()["plan"]
+                                    ui.task.read()["plan"]
                                         .as_array()
                                         .map(|plan| {
                                             plan.iter()
@@ -204,16 +204,16 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                             }}
                         </p>
                     </Show>
-                    <Show when=move || !ui.task()["confirmation"].is_null()>
+                    <Show when=move || !ui.task.read()["confirmation"].is_null()>
                         <div class="confirmation" role="alert">
                             <div class="confirmation-heading"><Icon name="shield" /><strong>"这一步需要你的确认"</strong><span class="badge pending">"待确认"</span></div>
-                            <p>{move || string(&ui.task()["confirmation"], "reason")}</p>
+                            <p>{move || string(&ui.task.read()["confirmation"], "reason")}</p>
                             <code>
-                                {move || tool_label(&string(&ui.task()["confirmation"], "tool"))}
+                                {move || tool_label(&string(&ui.task.read()["confirmation"], "tool"))}
                             </code>
                             <pre>
                                 {move || {
-                                    serde_json::to_string_pretty(&ui.task()["confirmation"]["args"])
+                                    serde_json::to_string_pretty(&ui.task.read()["confirmation"]["args"])
                                         .unwrap_or_default()
                                 }}
                             </pre>
@@ -237,7 +237,7 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                     </Show>
                     <ol class="step-list">
                         {move || {
-                            ui.task()["steps"]
+                            ui.task.read()["steps"]
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default()
@@ -276,36 +276,36 @@ pub(super) fn TaskProgress(ui: Ui) -> impl IntoView {
                         }}
                     </ol>
                     <Show when=move || {
-                        !string(&ui.task(), "message").is_empty()
-                            || !string(&ui.task(), "error").is_empty()
+                        !ui.task.with(|t| string(t, "message")).is_empty()
+                            || !ui.task.with(|t| string(t, "error")).is_empty()
                     }>
                         <p class=move || {
-                            if string(&ui.task(), "error").is_empty() {
+                            if ui.task.with(|t| string(t, "error")).is_empty() {
                                 "task-message"
                             } else {
                                 "inline-error"
                             }
                         }>
                             {move || {
-                                let err = string(&ui.task(), "error");
-                                if err.is_empty() { string(&ui.task(), "message") } else { err }
+                                let err = ui.task.with(|t| string(t, "error"));
+                                if err.is_empty() { ui.task.with(|t| string(t, "message")) } else { err }
                             }}
                         </p>
                     </Show>
-                    <Show when=move || ui.task()["state"] == "stopped">
+                    <Show when=move || ui.task.read()["state"] == "stopped">
                         <p class="field-hint">
                             "后续步骤已停止。停止前已发出的操作可能仍已执行，请检查手机。"
                         </p>
                     </Show>
                     <Show when=move || {
-                        matches!(string(&ui.task(), "state").as_str(), "failed" | "stopped") && ui.can_control()
+                        matches!(ui.task.with(|t| string(t, "state")).as_str(), "failed" | "stopped") && ui.can_control()
                     }>
                         <div class="button-row">
                             <button
                                 class="button primary small"
                                 disabled=move || ui.busy.get() || ui.ai.get()["aiReady"] != true
                                 on:click=move |_| {
-                                    let task = ui.task();
+                                    let task = ui.task.get_untracked();
                                     let text = continue_instruction(&task);
                                     let model = string(&task, "model");
                                     let auto = task["autoConfirm"] == true;

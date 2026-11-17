@@ -22,7 +22,7 @@ impl TaskImages {
             uploading: RwSignal::new(false),
             error: RwSignal::new(String::new()),
         };
-        let session = Memo::new(move |_| string(&ui.session(), "id"));
+        let session = Memo::new(move |_| ui.session.with(|s| string(s, "id")));
         Effect::new(move |_| {
             let _ = session.get();
             images.entries.set(vec![]);
@@ -39,7 +39,7 @@ impl TaskImages {
         if self.uploading.get_untracked() || ui.running() {
             return;
         }
-        let session = string(&ui.session(), "id");
+        let session = ui.session.with(|s| string(s, "id"));
         if session.is_empty() {
             self.error.set("请连接手机后添加图片".into());
             return;
@@ -109,7 +109,7 @@ impl TaskImages {
         if self.uploading.get_untracked() || ui.running() {
             return;
         }
-        let session = string(&ui.session(), "id");
+        let session = ui.session.with(|s| string(s, "id"));
         self.uploading.set(true);
         self.error.set(String::new());
         let pending = ui.client.get_value().delete_attachment(id.clone());
@@ -136,7 +136,7 @@ pub(super) fn ImageInputs(ui: Ui, images: TaskImages) -> impl IntoView {
                 "添加图片"
                 <input type="file" accept="image/jpeg,image/png" multiple
                     aria-label="添加任务图片"
-                    disabled=move || images.uploading.get() || ui.running() || ui.session().is_null()
+                    disabled=move || images.uploading.get() || ui.running() || ui.session.with(Value::is_null)
                     on:change=move |event| {
                         if let Some(input) = event.current_target().and_then(|v| v.dyn_into::<HtmlInputElement>().ok()) {
                             if let Some(files) = input.files() { images.add(ui, files); }
