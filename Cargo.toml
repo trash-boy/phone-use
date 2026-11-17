@@ -101,5 +101,17 @@ codegen-units = 1
 strip = true
 
 # Keep WASM feature metadata available to wasm-bindgen while removing debug info.
+# Optimise the browser bundle for size: it is downloaded on every page load.
 [profile.release.package.ictl-web]
+strip = "debuginfo"
+opt-level = "s"
+
+# Production WASM bundle (browser-control/scripts/build-wasm.sh with
+# WASM_BUILD_PROFILE=release). panic = "abort" cannot be set per package, so the
+# browser build gets its own profile; native release binaries keep unwinding.
+[profile.wasm-release]
+inherits = "release"
+panic = "abort"
+opt-level = "s"
+lto = true
 strip = "debuginfo"

@@ -1,0 +1,9 @@
+# Single toolchain for local development and CI (ci.yml, browser.yml) and the
+# Docker builder images (browser-control/Dockerfile, docker/Dockerfile use the
+# matching rust:1.99.1 image). The MSRV job overrides this with
+# `cargo +1.88.0`; Cargo.toml's rust-version stays the supported minimum.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
