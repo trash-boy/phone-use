@@ -1,0 +1,26 @@
+{
+  "upstream": "https://github.com/claration/impactor (3rdparty/apple-codesign-0.29.0)",
+  "revision": "b13d99559febd63e3710dfdd0ef8cdd78d10ae13",
+  "release": "Impactor v2.7.2",
+  "path": "3rdparty/apple-codesign-0.29.0 (Impactor), originally https://github.com/indygreg/apple-platform-rs",
+  "version": "0.29.0",
+  "license": "MPL-2.0",
+  "upstreamArchiveSha256": "unknown",
+  "note": "importedFiles are SHA-256 hashes of the files as first vendored in phone-use commit a8aa285. That commit recorded src/ as unmodified upstream, while Cargo.toml already carried the local edits listed below; neither was re-verified against an upstream archive, so upstreamArchiveSha256 and upstream file hashes are unknown.",
+  "changes": [
+    "Impactor's 0o755 file permission patch (Impactor commit 428b42f), as shipped in Impactor's 3rdparty copy.",
+    "Removed tests/, docs/, src/testdata/ (sample certificates and keys), Cargo.lock and Cargo.toml.orig; Cargo.toml drops [[test]] targets, so the vendored unit tests cannot run and are not run here.",
+    "Cargo.toml: zip 2.x -> 9.4.1 (security advisory; only notarization writes zip archives, API compatible). Sources unchanged."
+  ],
+  "phoneUseHistory": [
+    "a8aa285 (import)",
+    "bb9c6d5",
+    "70d1a58"
+  ],
+  "importedFiles": {
+    "Cargo.toml": "ae3f655e8c0d55661a199e23845ee6c89eb3cd52b7e85581cafe4faa625251e4"
+  },
+  "modifiedFiles": {
+    "Cargo.toml": "5d28ab679ac12dc950599dcd092217b7058544df5befa3e6c2687810b2a7356c"
+  }
+}

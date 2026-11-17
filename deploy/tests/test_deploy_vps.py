@@ -142,6 +142,63 @@ class DeployTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     deploy_vps.replace_image(source, IMAGE)
 
+    def missing_previous(self, pull_ok):
+        original = self.run.side_effect
+        state = {"pulled": False}
+
+        def run(args, **kwargs):
+            if args[-1] == "old-image:keep-me":
+                if "pull" in args:
+                    self.calls.append((args, kwargs))
+                    if not pull_ok:
+                        raise deploy_vps.subprocess.CalledProcessError(1, args)
+                    state["pulled"] = True
+                    return ""
+                if args[:3] == ["docker", "image", "inspect"] and not state["pulled"]:
+                    self.calls.append((args, kwargs))
+                    raise deploy_vps.subprocess.CalledProcessError(1, args)
+            return original(args, **kwargs)
+
+        self.run.side_effect = run
+
+    def test_missing_rollback_image_that_cannot_be_pulled_aborts_before_changes(self):
+        self.missing_previous(pull_ok=False)
+        with self.assertRaisesRegex(RuntimeError, "Rollback image old-image:keep-me is not available"):
+            self.deploy()
+        self.assertEqual((self.stack / "compose.yaml").read_text(), COMPOSE)
+        self.assertFalse(any(IMAGE in args for args, _ in self.calls if "pull" in args))
+        self.assertFalse(any("up" in args for args, _ in self.calls))
+        self.assertFalse((self.stack / "ci-deployments").exists())
+
+    def test_missing_rollback_image_is_pulled_with_the_job_credentials(self):
+        self.missing_previous(pull_ok=True)
+        self.deploy()
+        pull = next(args for args, _ in self.calls if "pull" in args and args[-1] == "old-image:keep-me")
+        login = next(args for args, _ in self.calls if "login" in args)
+        self.assertEqual(pull[:3], login[:3], "uses the same temporary docker config")
+        self.assertEqual((self.stack / "compose.yaml").read_text(), COMPOSE.replace("old-image:keep-me", IMAGE))
+
+    def test_public_url_override_drives_health_checks_and_record(self):
+        checked = []
+        original = deploy_vps.http_check
+        deploy_vps.http_check = lambda url, expected, **kw: checked.append(url)
+        self.addCleanup(setattr, deploy_vps, "http_check", original)
+        result = deploy_vps.deploy(request(), self.stack, self.run, public_url="https://phone.example.com/x/")
+        self.assertEqual(result["publicUrl"], "https://phone.example.com/x/")
+        self.assertIn("https://phone.example.com/x/", checked)
+        self.assertIn("https://phone.example.com/api/config", checked)
+        self.assertNotIn("amazingly.top", " ".join(checked))
+
+    def test_public_url_comes_from_cli_then_environment_then_default(self):
+        env = {deploy_vps.PUBLIC_URL_ENV: "https://env.example.com/"}
+        self.assertEqual(deploy_vps.parse_args([], {}).public_url, deploy_vps.PUBLIC_URL)
+        self.assertEqual(deploy_vps.parse_args([], env).public_url, "https://env.example.com/")
+        self.assertEqual(deploy_vps.parse_args(["--public-url", "https://cli.example.com/"], env).public_url,
+                         "https://cli.example.com/")
+        for bad in ["http://plain.example.com/", "https://user:pw@example.com/", "https://example.com/?q=1"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                deploy_vps.parse_args(["--public-url", bad], {})
+
     def test_retry_attempt_has_its_own_backup(self):
         self.deploy()
         payload = request()

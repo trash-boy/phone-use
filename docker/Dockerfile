@@ -3,7 +3,9 @@
 # 所有版本锁在 ARG 里；Rust 依赖由 Cargo.lock 锁定（--locked）。
 
 ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
-ARG RUST_IMAGE=rust:1-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+# Matches rust-toolchain.toml (which .dockerignore keeps out of the build context,
+# so the image's toolchain is used as is).
+ARG RUST_IMAGE=rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07
 
 # ---- 编译 ----
 # 依赖下载和编译产物放在构建缓存里：改 README、compose 等不再从头编译约 570 个 crate

@@ -1,0 +1,22 @@
+{
+  "upstream": "https://github.com/claration/impactor",
+  "revision": "b13d99559febd63e3710dfdd0ef8cdd78d10ae13",
+  "release": "Impactor v2.7.2",
+  "path": "plume_store (Impactor workspace crate)",
+  "version": "2.7.2",
+  "license": "MIT",
+  "upstreamArchiveSha256": "unknown",
+  "note": "importedFiles are SHA-256 hashes of the files as first vendored in phone-use commit a8aa285. That commit recorded src/ as unmodified upstream, while Cargo.toml already carried the local edits listed below; neither was re-verified against an upstream archive, so upstreamArchiveSha256 and upstream file hashes are unknown.",
+  "changes": [
+    "Cargo.toml: expand workspace inheritance into explicit versions. Sources unchanged."
+  ],
+  "phoneUseHistory": [
+    "a8aa285 (import)"
+  ],
+  "importedFiles": {
+    "Cargo.toml": "47e1c507be30612d18e886a5b55c2585243c5e9f2f107d1daef8a146fb19bc73"
+  },
+  "modifiedFiles": {
+    "Cargo.toml": "47e1c507be30612d18e886a5b55c2585243c5e9f2f107d1daef8a146fb19bc73"
+  }
+}

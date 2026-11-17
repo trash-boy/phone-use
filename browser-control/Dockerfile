@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1
+# Base images are pinned by multi-arch index digest (tag kept for readability).
+# The Rust image matches rust-toolchain.toml; update tag and digest together, e.g.
+#   docker buildx imagetools inspect rust:1.99.1-trixie
+ARG ASSETS_IMAGE=ghcr.io/derrors/iphone-control:0.1.4@sha256:eacd305229fc825872f386010a86191c2f3172c660835e3d74cff77c77766e7e
+ARG RUST_IMAGE=rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07
+ARG NODE_IMAGE=node:22-trixie-slim@sha256:68c76cfad89921b927eae28ba21407475e29d0ce450afcdbe70c1532db042b64
+ARG PYTHON_IMAGE=python:3.11-slim-trixie@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 # Reuse the published WDA assets. Both Rust executables are built from this source.
-FROM ghcr.io/derrors/iphone-control:0.1.4 AS assets
-FROM rust:1.90-trixie AS rust-build
-ARG CARGO_BUILD_JOBS=1
+FROM ${ASSETS_IMAGE} AS assets
+FROM ${RUST_IMAGE} AS rust-build
+# Parallel rustc jobs. 2 keeps peak memory within a small VPS; CI passes $(nproc).
+ARG CARGO_BUILD_JOBS=2
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
@@ -36,15 +44,15 @@ RUN tool="wasm-bindgen-0.2.130-$(uname -m)-unknown-linux-musl" \
     && tar -xzf "/tmp/${tool}.tar.gz" -C /tmp \
     && install -m 755 "/tmp/${tool}/wasm-bindgen" /usr/local/bin/wasm-bindgen
 COPY browser-control/scripts/build-wasm.sh browser-control/scripts/build-wasm.sh
+# The WASM build has its own target cache (separate id and CARGO_TARGET_DIR), so
+# it never reuses artifacts written by the native rust-build stage above.
+ENV CARGO_TARGET_DIR=/src/target-wasm
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/src/target \
-    # Source archive timestamps can predate an overlapping build's cached WASM.
-    # Recompile the web crate against this stage's source snapshot.
-    touch crates/ictl-web/src/lib.rs \
-    && WASM_BUILD_PROFILE=release sh browser-control/scripts/build-wasm.sh
+    --mount=type=cache,id=phone-use-wasm-target,target=/src/target-wasm,sharing=locked \
+    WASM_BUILD_PROFILE=release sh browser-control/scripts/build-wasm.sh
 
-FROM node:22-trixie-slim AS web-build
+FROM ${NODE_IMAGE} AS web-build
 ARG WEB_BASE=/
 WORKDIR /web
 COPY browser-control/package.json browser-control/package-lock.json ./
@@ -54,7 +62,7 @@ COPY browser-control/ ./
 COPY --from=wasm-build /src/browser-control/pkg/ ./pkg/
 RUN npm run build:assets -- --base="${WEB_BASE}"
 
-FROM python:3.11-slim-trixie
+FROM ${PYTHON_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 libstdc++6 libssl3t64 zlib1g libgomp1 libgl1 libglib2.0-0t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 control

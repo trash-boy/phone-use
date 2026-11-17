@@ -3,7 +3,7 @@ import { fixtureImageBase64 } from './fixtures/screen-image.mjs';
 import { once } from 'node:events';
 import http from 'node:http';
 import WebSocket from 'ws';
-import { encodeFrame, jsonPayload } from '../src/relay-protocol.mjs';
+import { encodeFrame, jsonPayload } from './support/relay-protocol.mjs';
 import { contract, origin, token, until, harness, ready } from './helpers/rust-gateway.mjs';
 
 // Android sessions driven through the browser ADB relay.

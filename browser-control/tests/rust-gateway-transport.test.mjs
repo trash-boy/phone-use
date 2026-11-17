@@ -5,7 +5,7 @@ import net from 'node:net';
 import path from 'node:path';
 import * as plist from 'plist';
 import WebSocket from 'ws';
-import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload } from '../src/relay-protocol.mjs';
+import { encodeFrame, decodeFrame, FrameType as F, jsonPayload, parsePayload } from './support/relay-protocol.mjs';
 import {
   contract, device, origin, token, pause, until, harness, peer, manualPeer, ready, nativeEnv,
   muxConnect, muxPacket, muxReader, modelReplyTask, rejectUpgrade,

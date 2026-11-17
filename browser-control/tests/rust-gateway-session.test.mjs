@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as plist from 'plist';
 import WebSocket from 'ws';
-import { encodeFrame, jsonPayload, FrameType as F, parsePayload } from '../src/relay-protocol.mjs';
+import { encodeFrame, jsonPayload, FrameType as F, parsePayload } from './support/relay-protocol.mjs';
 import {
   binary, contract, device, origin, token, until, harness, peer, manualPeer, ready, nativeEnv, rejectUpgrade,
   muxConnect, muxPacket,

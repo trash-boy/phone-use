@@ -13,7 +13,7 @@ import net from 'node:net';
 import http from 'node:http';
 import * as plist from 'plist';
 import WebSocket from 'ws';
-import { encodeFrame, decodeFrame, FrameType as F, jsonPayload } from '../../src/relay-protocol.mjs';
+import { encodeFrame, decodeFrame, FrameType as F, jsonPayload } from '../support/relay-protocol.mjs';
 
 export const binary = process.env.RUST_GATEWAY_BIN;
 export const device = { serialNumber: '00008110-001234567890001E', vendorId: 1452, productId: 4776 };

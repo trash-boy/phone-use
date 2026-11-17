@@ -1,0 +1,27 @@
+{
+  "upstream": "https://github.com/claration/impactor",
+  "revision": "b13d99559febd63e3710dfdd0ef8cdd78d10ae13",
+  "release": "Impactor v2.7.2",
+  "path": "omnisette (Impactor workspace crate)",
+  "version": "2.7.2",
+  "license": "MPL-2.0",
+  "upstreamArchiveSha256": "unknown",
+  "note": "importedFiles are SHA-256 hashes of the files as first vendored in phone-use commit a8aa285. That commit recorded src/ as unmodified upstream, while Cargo.toml already carried the local edits listed below; neither was re-verified against an upstream archive, so upstreamArchiveSha256 and upstream file hashes are unknown.",
+  "changes": [
+    "src/lib.rs: add anisette_url_v3()/set_anisette_url_v3() so a self-hosted anisette v3 server can be configured (commented in place, file stays MPL-2.0; phone-use 8f1de11).",
+    "Cargo.toml: expand workspace inheritance, use reqwest rustls-no-provider, make local anisette (StoreServicesCore / android-loader) the optional local-anisette feature; phone-use does not enable it."
+  ],
+  "phoneUseHistory": [
+    "a8aa285 (import)",
+    "bb9c6d5",
+    "8f1de11"
+  ],
+  "importedFiles": {
+    "Cargo.toml": "4285eabdf4f1214f2416b0bb0b4af51b42e7cc6080e88a2ca02b02c06d5ccf6b",
+    "src/lib.rs": "1ed6976e8658799a87e5e342cf283e4f93fc45525f1713a8ff15473c44a28fc4"
+  },
+  "modifiedFiles": {
+    "Cargo.toml": "b952d122c58191eb3e882ecbaed61135ec39422d8a79a297a3c37a583c2e197f",
+    "src/lib.rs": "422b21d7c984aad02bc64686b7d4565b4cceffc1632b1784305fae4ee43e8e01"
+  }
+}

@@ -1,34 +1,52 @@
 name: CI
 
 on:
+  pull_request:
   push:
-    branches: ["release-*"]
+    branches: [main, "release-*"]
 
 permissions:
   contents: read
 
-# Only release branches publish. Serialize the entire run so an older build
-# cannot deploy after a newer release; let an active deployment finish.
+# Release pushes share one production group and are never cancelled, so an older
+# build cannot deploy after a newer release and an active deployment finishes.
+# PRs and main are grouped per ref (superseded runs are cancelled) and never
+# wait behind a deployment.
 concurrency:
-  group: release-vps-production
-  cancel-in-progress: false
+  group: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')) && 'release-vps-production' || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')) }}
 
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # 锁定工具链（与 Docker 构建镜像一致）：新版 clippy 的 lint 不会在代码没变时把 CI 弄挂
+      # Same toolchain as rust-toolchain.toml and the rust:1.99.1 Docker builder
+      # images; a pinned clippy keeps new lints from failing unchanged code.
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
+          targets: wasm32-unknown-unknown
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # vendor/ 是上游代码，不格式化；只检查本仓库的包
+      # Every workspace member (vendor/ is excluded from the workspace and stays
+      # in upstream format). Derived from metadata so new crates are covered.
       - name: fmt
-        run: for p in ictl-l10n ictl-device ictl-wda ictl-sign ictl-unlock ictl-daemon ictl-mcp ictl-protocol iphone-control; do cargo fmt -p $p -- --check; done
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[].name')
+          args=()
+          for p in $packages; do args+=(-p "$p"); done
+          echo "Checking formatting of: $packages"
+          cargo fmt "${args[@]}" -- --check
       # --all-features：默认不编的 debug-cmds（调试子命令）也要能编译
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Runs ictl-gateway and ictl-web native tests too; browser.yml does not repeat them.
       - run: cargo test --workspace --all-features --locked
+      # The vendored jktcp carries local fixes and regression tests (THIRD_PARTY.md).
+      # local_tcp/handle_speed need root to create a TUN device.
+      - name: vendored jktcp regression tests
+        run: cargo test --locked --manifest-path vendor/jktcp/Cargo.toml -- --skip tests::local_tcp --skip tests::handle_speed
 
   # macOS（Apple Silicon）上能编译、测试通过；格式和平台无关，上面已经查过
   macos:
@@ -37,15 +55,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
-          components: clippy
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       # --all-features：默认不编的 debug-cmds（调试子命令）也要能编译
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
 
-  # Cargo.toml 声明的最低版本（rust-version）要真能编译
+  # Cargo.toml 声明的最低版本（rust-version）要真能编译。RUSTUP_TOOLCHAIN overrides
+  # rust-toolchain.toml for this job only.
   msrv:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -74,7 +96,9 @@ jobs:
       - uses: actions/checkout@v7
       - run: python3 -m unittest discover -s deploy/tests -v
 
+  # Only pushes to release-* build, publish and deploy.
   release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')
     needs: [rust, macos, msrv, secrets, browser, deployment-tests]
     permissions:
       contents: read

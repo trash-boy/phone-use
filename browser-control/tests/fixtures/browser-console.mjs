@@ -90,6 +90,12 @@ const fetchImpl = async (url, options = {}) => {
   if (url.endsWith("/attachments") && options.method === "POST") {
     return reply({ id: `image-${fixture.calls.length}`, name: body.name, mimeType: body.mimeType, size: atob(body.dataBase64).length });
   }
+  // Older gateways have no screen.jpg route: the default reply below is JSON,
+  // which the client must treat as unsupported and fall back to imageBase64.
+  if (url.endsWith("/screen.jpg") && fixture.serveScreenJpeg) {
+    const bytes = Uint8Array.from(atob(fixture.image.imageBase64), (c) => c.charCodeAt(0));
+    return new Response(bytes, { headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" } });
+  }
   if (url.endsWith("/preview")) {
     if (fixture.holdNextPreview) {
       fixture.holdNextPreview = false;

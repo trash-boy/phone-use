@@ -22,7 +22,7 @@
 | 检查 | 结果及范围 |
 |---|---|
 | Node 自动化测试 | 96/96 通过，0 失败、跳过或取消。包含真实 HTTP/WebSocket/TCP/Unix Socket、原生 CLI fixture、发布 SDK 与明确标注的模拟 USB peer |
-| TypeScript | `npm run typecheck` 通过 |
+| 类型检查（当时为 TypeScript，现为 Rust/WASM `cargo check`） | `npm run typecheck` 通过 |
 | 前端构建 | `npm run build` 通过 |
 | 原生发布包 | `iphone-control0.1.4` 下载 SHA256 校验及 Mac 二进制签名验证通过 |
 | 原生兼容性 | 未修改的发布版 daemon 经虚拟 mux 与模拟 Lockdown peer 通信，识别设备并返回 needs_trust；该项使用模拟设备 |
@@ -59,7 +59,7 @@ Rust 网关迁移后，容器 Dockerfile 已改为从当前源码编译两个 Ru
 
 ## Rust 网关迁移
 
-服务端入口迁移到 `crates/ictl-gateway`，启动命令和 Docker 运行阶段切换到 Rust。原 Node 实现曾放在 `tests/reference` 作为测试参照，现已删除，相关断言已移到针对 Rust 网关的契约测试（`tests/rust-gateway-*.test.mjs`）。保留 React/TypeScript 工作台、发布版 WebUSB SDK 和原 Rust 控制引擎。
+服务端入口迁移到 `crates/ictl-gateway`，启动命令和 Docker 运行阶段切换到 Rust。原 Node 实现曾放在 `tests/reference` 作为测试参照，现已删除，相关断言已移到针对 Rust 网关的契约测试（`tests/rust-gateway-*.test.mjs`）。当时保留了 React/TypeScript 工作台、发布版 WebUSB SDK 和原 Rust 控制引擎；工作台随后已改为 Leptos/WASM（见下文「浏览器 Rust/WASM 重构」），当前不再包含 React/TypeScript 代码。
 
 自动化测试使用独立 Rust 服务进程、Node 原生 CLI fixture、HTTP 模型 fixture 和发布版 SDK，覆盖配对恢复互斥、命令去重及缓存淘汰、USB MTU、准备输入、任务确认与停止、静态文件、配置传递和 HTTP 读取期限。
 

@@ -1,3 +1,6 @@
+// Test-only Node codec for the relay frame format. The runtime implementations
+// are the Rust gateway (crates/ictl-gateway) and the WASM client (crates/ictl-web);
+// tests use this independent encoder to check both against the wire format.
 export const FrameType = Object.freeze({
   DeviceHello: 1, OpenStream: 2, OpenResult: 3, StreamData: 4, StreamClose: 5,
   InstallProgress: 6, Error: 7, Ping: 8, Pong: 9, StartPairing: 10,

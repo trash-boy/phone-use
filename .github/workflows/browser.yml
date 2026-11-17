@@ -11,7 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.90.0
+      # Same toolchain as rust-toolchain.toml / ci.yml.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
@@ -30,9 +31,8 @@ jobs:
           (cd /tmp && awk -v file="${tool}.tar.gz" '{print $1 "  " file}' "${tool}.tar.gz.sha256sum" | sha256sum -c -)
           tar -xzf "/tmp/${tool}.tar.gz" -C /tmp
           sudo install -m 755 "/tmp/${tool}/wasm-bindgen" /usr/local/bin/wasm-bindgen
-      - run: cargo test --locked -p ictl-web -p ictl-gateway
+      # Native ictl-web/ictl-gateway tests and fmt run once, in ci.yml's rust job.
       - run: cargo clippy --locked -p ictl-web --target wasm32-unknown-unknown -- -D warnings
-      - run: cargo fmt -p ictl-web -- --check
       - run: cargo build --locked -p ictl-gateway --bin iphone-control-gateway
       - run: npm ci
         working-directory: browser-control

@@ -16,7 +16,7 @@
     "start": "sh scripts/start-gateway.sh",
     "web:dev": "npm run wasm:build && vite --host 127.0.0.1",
     "build": "WASM_BUILD_PROFILE=release npm run wasm:build && vite build",
-    "typecheck": "cargo +1.90.0 check --locked -p ictl-web --target wasm32-unknown-unknown --manifest-path ../Cargo.toml",
+    "typecheck": "cargo check --locked -p ictl-web --target wasm32-unknown-unknown --manifest-path ../Cargo.toml",
     "test:rust": "sh scripts/test-rust.sh",
     "wasm:build": "sh scripts/build-wasm.sh",
     "pretest": "npm run wasm:build && npm run build:assets",

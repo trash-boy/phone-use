@@ -12,20 +12,24 @@ Most of the code comments, design documents and commit messages in this reposito
 
 ## Building and testing without a phone
 
-You need Rust 1.88 or later (CI pins 1.99.1) and a C compiler. Everything except the device tests runs offline:
+You need rustup and a C compiler. [`rust-toolchain.toml`](rust-toolchain.toml) pins the toolchain CI uses (1.99.1, with clippy, rustfmt and the `wasm32-unknown-unknown` target), so rustup installs and selects it automatically. The minimum supported version is still 1.88 (`rust-version`); CI checks it separately with `RUSTUP_TOOLCHAIN=1.88.0 cargo check --workspace --locked`. Everything except the device tests runs offline:
 
 ```bash
 # --all-features also builds the debug-cmds feature, as CI does
 cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-# vendor/ is upstream code and isn't formatted; check only this repository's packages:
-for p in ictl-l10n ictl-device ictl-wda ictl-sign ictl-unlock ictl-daemon ictl-mcp ictl-protocol iphone-control; do cargo fmt -p $p -- --check; done
+# vendor/ is upstream code and isn't formatted; check every workspace member (as CI does):
+cargo fmt $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name | "-p " + .') -- --check
+# the vendored jktcp keeps its own regression tests (the two TUN tests need root):
+cargo test --locked --manifest-path vendor/jktcp/Cargo.toml -- --skip tests::local_tcp --skip tests::handle_speed
 ```
+
+The browser console (`browser-control/`, Rust/WASM in `crates/ictl-web`) has its own checks; see [browser-control/README.md](browser-control/README.md).
 
 Or, without Rust installed:
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src rust:1-trixie sh -c \
+docker run --rm -v "$PWD":/src -w /src rust:1.99.1-trixie sh -c \
   'rustup component add clippy && cargo test --workspace --all-features --locked && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings'
 ```
 
@@ -43,7 +47,7 @@ python3 -m venv .venv && .venv/bin/pip install -r tests/device/requirements.txt
 .venv/bin/python tests/device/run.py '[["iphone_launch_app", {"app": "设置"}], ["iphone_screenshot", {}]]'
 ```
 
-`run.py` prints every result with its wall time and saves screenshots to `./shots`. Set `MCP_CMD` for a source install (for example `MCP_CMD="iphone-control mcp"`). Please mention in the pull request what you ran on which device and iOS version.
+`tests/device/run.py` is manual only: CI has no phone and never runs it, so a green CI run says nothing about device behaviour. `run.py` prints every result with its wall time and saves screenshots to `./shots`. Set `MCP_CMD` for a source install (for example `MCP_CMD="iphone-control mcp"`). Please mention in the pull request what you ran on which device and iOS version.
 
 On macOS, the full checklist (setup, `debug` checks, coexistence with Finder, reconnect) is in [docs/dev/macos-verification.md](docs/dev/macos-verification.md).
 
@@ -73,7 +77,7 @@ Notes:
 ## Pull requests
 
 - Keep them focused; describe what changed and how you tested it (offline and/or which device).
-- CI must pass: format, clippy with `-D warnings`, tests (on Linux and macOS), the MSRV check, gitleaks and the image build.
+- CI runs on every pull request and push to `main`: format (all workspace members), clippy with `-D warnings`, tests on Linux and macOS (plus the vendored jktcp tests), the MSRV check, gitleaks, the browser WASM/Node/Chrome checks and the deployment script tests. It must pass. Only pushes to `release-*` branches also build, publish and deploy the browser image.
 - User-visible changes get a line in [CHANGELOG.md](CHANGELOG.md) and [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md) under *Unreleased* (a Chinese line is welcome but optional for outside contributors; maintainers add it before release).
 
 ## Documentation site

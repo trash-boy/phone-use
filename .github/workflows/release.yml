@@ -27,13 +27,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Count build CPUs
+        id: cpus
+        run: echo "jobs=$(nproc)" >> "$GITHUB_OUTPUT"
       - name: Build complete web and native image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: browser-control/Dockerfile
           platforms: linux/amd64
-          build-args: WEB_BASE=/iphone/
+          build-args: |
+            WEB_BASE=/iphone/
+            CARGO_BUILD_JOBS=${{ steps.cpus.outputs.jobs }}
           load: true
           tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
           labels: |

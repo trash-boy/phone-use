@@ -794,3 +794,53 @@ test('each task step shows its observation, model and action time', async t => {
   assert.equal(await page.locator('.step-timing').count(), 1, 'a step without timings shows none');
   assert.equal(await page.locator('.step-timing').textContent(), '观察 0.90 秒 · 模型 3.72 秒 · 操作 0.85 秒');
 });
+
+test('screenshots load from screen.jpg as object URLs, revoke the previous one, and fall back to base64 without the route', async t => {
+  const page = await pageFor(t);
+  await page.evaluate(() => { fixture.serveScreenJpeg = true; });
+  await connect(page);
+  const image = page.locator('.phone-screen');
+  const first = await image.getAttribute('src');
+  assert.match(first, /^blob:/);
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/screen.jpg')).length), 1);
+  await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
+  await page.waitForFunction(source => document.querySelector('.phone-screen')?.getAttribute('src') !== source, first);
+  assert.match(await image.getAttribute('src'), /^blob:/);
+  assert.equal(await page.evaluate(src => fetch(src).then(() => 'alive', () => 'revoked'), first), 'revoked');
+  await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 100);
+  // Older gateway: the route answers JSON, so the base64 image is used and the
+  // route is not requested again for this session.
+  await page.evaluate(() => { fixture.serveScreenJpeg = false; });
+  const jpegCalls = await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/screen.jpg')).length);
+  for (let i = 0; i < 2; i++) {
+    const before = await image.getAttribute('src');
+    await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
+    await page.waitForFunction(source => document.querySelector('.phone-screen')?.getAttribute('src') !== source, before);
+    assert.match(await image.getAttribute('src'), /^data:image\/jpeg;base64,/);
+    await page.waitForFunction(() => !document.querySelector('#phone-text').disabled);
+  }
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/screen.jpg')).length), jpegCalls + 1);
+});
+
+test("a long task shows the total step count and each kept step's own number", async (t) => {
+  const page = await pageFor(t);
+  await connect(page);
+  await page.evaluate(() => {
+    fixture.state.task = {
+      id: "task", instruction: "Long fixture task", state: "running", confirmation: null, totalSteps: 250,
+      steps: [
+        { id: "a", number: 249, tool: "iphone_tap", reason: "Older kept step", state: "completed" },
+        { id: "b", number: 250, tool: "iphone_tap", reason: "Newest step", state: "running" },
+      ],
+    };
+  });
+  await page.locator(".step-count").filter({ hasText: "250 步" }).waitFor();
+  assert.deepEqual(await page.locator(".step-number").allTextContents(), ["249", "250"]);
+  // Older gateways: no totalSteps/number, so count and number by position.
+  await page.evaluate(() => {
+    fixture.state.task = { ...fixture.state.task, totalSteps: undefined,
+      steps: fixture.state.task.steps.map(({ number, ...step }) => step) };
+  });
+  await page.locator(".step-count").filter({ hasText: "2 步" }).waitFor();
+  assert.deepEqual(await page.locator(".step-number").allTextContents(), ["1", "2"]);
+});

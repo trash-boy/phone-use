@@ -10,6 +10,8 @@ docs
 **/*.rs.bk
 README.md
 website
+# Docker builds use the toolchain of their pinned rust image (same version).
+rust-toolchain.toml
 
 browser-control/pkg/
 browser-control/pkg-node/

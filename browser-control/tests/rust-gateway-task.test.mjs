@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { fixtureImageBase64 } from './fixtures/screen-image.mjs';
 import http from 'node:http';
 import WebSocket from 'ws';
-import { encodeFrame, decodeFrame, FrameType as F } from '../src/relay-protocol.mjs';
+import { encodeFrame, decodeFrame, FrameType as F } from './support/relay-protocol.mjs';
 import {
   contract, pause, until, harness, peer, ready, modelReplyTask, modelCompletion, nativeCounts,
 } from './helpers/rust-gateway.mjs';
