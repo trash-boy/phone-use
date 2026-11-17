@@ -65,8 +65,9 @@ export async function pairDevice({ registryApiUrl, token, target, log = () => {}
     const commands = new AndroidCommands({ deviceId: target.hello.serialNumber, shell: (command, abort, timeout) => runShell(target.adb, command, abort, timeout), capture: (abort, region, previous) => capture(target.adb, abort, region, previous, target.video), controller: target.scrcpy.controller });
     const url = new URL("/device/ws", registryApiUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.searchParams.set("token", token);
-    const socket = new WebSocket(url);
+    // The session token travels as a WebSocket subprotocol, not in the URL, so it
+    // cannot end up in proxy or access logs. The gateway selects `ictl.relay`.
+    const socket = new WebSocket(url, ["ictl.relay", `ictl.token.${token}`]);
     const relay = new AndroidRelay(socket, target.hello.serialNumber, (request, abort) => commands.execute(request, abort), { log, onClose: () => void closeDeviceRelayTarget(target) });
     target.relay = relay;
     socket.addEventListener("open", () => {
