@@ -1275,7 +1275,14 @@ async fn dispatch(g: Arc<Gateway>, request: Request<Body>) -> Result<Response> {
             let deadline = control_deadline
                 .expect("control route captured admission")
                 .map_err(|_| ApiError::unavailable("Action clock unavailable"))?;
-            Ok(reply(200, s.preview_at(entered, deadline).await?))
+            let mut preview = s.preview_at(entered, deadline).await?;
+            // `?image=0`: the client loads the picture from `screen.jpg`, so skip the base64 copy.
+            if request.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "image=0"))
+                && let Some(fields) = preview.as_object_mut()
+            {
+                fields.remove("imageBase64");
+            }
+            Ok(reply(200, preview))
         }
         (Method::POST, ["setup"]) => {
             let deadline = control_deadline

@@ -118,6 +118,10 @@ impl Ui {
         revoke(&self.screen_src.get_untracked());
         self.screen_src.set(String::new());
     }
+    /// Whether previews can omit the base64 image because `screen.jpg` serves it.
+    fn lean_screen(self, session_id: &str) -> bool {
+        self.screen_jpg_unsupported.get_value() != session_id
+    }
     pub fn accept_screen(self, session_id: &str, screen: JsValue) {
         if !self.current_session(session_id) || screen.is_null() || screen.is_undefined() {
             return;
@@ -150,8 +154,12 @@ impl Ui {
                 },
                 None => None,
             };
-            let source =
-                source.unwrap_or_else(|| format!("data:image/jpeg;base64,{}", base64.as_string().unwrap_or_default()));
+            // A lean preview has no base64: keep the current frame; the next capture
+            // asks for the JSON image if the route turned out to be unsupported.
+            let Some(source) = source.or_else(|| base64.as_string().map(|b| format!("data:image/jpeg;base64,{b}")))
+            else {
+                return;
+            };
             if self.screen_generation.get_value() != generation || !self.current_session(&session_id) {
                 revoke(&source);
                 return;
@@ -183,7 +191,7 @@ impl Ui {
                         text(&result, "message")
                     }));
                 }
-                self.accept_screen(&session_id, resolved(client.screen().into()).await?);
+                self.accept_screen(&session_id, resolved(client.screen(self.lean_screen(&session_id)).into()).await?);
                 Ok(JsValue::UNDEFINED)
             })
         });
@@ -194,7 +202,7 @@ impl Ui {
             if !self.current_session(&session_id) {
                 return Promise::resolve(&JsValue::UNDEFINED);
             }
-            let pending = client.screen();
+            let pending = client.screen(self.lean_screen(&session_id));
             future_to_promise(async move {
                 self.accept_screen(&session_id, resolved(pending.into()).await?);
                 Ok(JsValue::UNDEFINED)
@@ -357,7 +365,7 @@ fn App(options: JsValue) -> impl IntoView {
         if session.is_empty() || task.is_empty() || !captured || untrack(|| ui.android() || !ui.ready()) {
             return;
         }
-        let pending = ui.client.get_value().screen();
+        let pending = ui.client.get_value().screen(ui.lean_screen(&session));
         spawn_local(async move {
             if let Ok(image) = resolved(pending.into()).await {
                 ui.accept_screen(&session, image);

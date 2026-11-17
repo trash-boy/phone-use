@@ -286,6 +286,10 @@ contract('binary screen route returns the latest frame bytes with session auth a
   // The JSON preview is unchanged and shows the same frame.
   const preview = await (await app.api(`/api/sessions/${s.id}/preview`, s.token)).json();
   assert.equal(preview.imageBase64, fixtureImageBase64);
+  // `?image=0` keeps the metadata but leaves the picture to screen.jpg.
+  const lean = await (await app.api(`/api/sessions/${s.id}/preview?image=0`, s.token)).json();
+  assert.equal(lean.imageBase64, undefined);
+  assert.equal(lean.caption, preview.caption);
   assert.equal((await app.api(`/api/sessions/${s.id}`, s.token, undefined, {}, 'DELETE')).status, 200);
   assert.equal((await app.api(route, s.token)).status, 404);
 });

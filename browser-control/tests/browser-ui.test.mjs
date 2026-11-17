@@ -625,7 +625,7 @@ test("a delayed command from a previous session cannot start a screenshot reques
   const countBefore = await page.evaluate(
     () =>
       fixture.calls.filter(
-        (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+        (c) => c.url?.includes("/session-2/") && /\/preview(\?image=0)?$/.test(c.url),
       ).length,
   );
   await page.evaluate(() => fixture.releaseCommand());
@@ -636,7 +636,7 @@ test("a delayed command from a previous session cannot start a screenshot reques
     await page.evaluate(
       () =>
         fixture.calls.filter(
-          (c) => c.url?.includes("/session-2/") && c.url.endsWith("/preview"),
+          (c) => c.url?.includes("/session-2/") && /\/preview(\?image=0)?$/.test(c.url),
         ).length,
     ),
     countBefore,
@@ -690,7 +690,7 @@ test('iPhone idle and readiness changes create no video or screenshot traffic; m
   assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview')).length), 0);
   await page.getByRole('button', {name: '刷新屏幕', exact: true}).click();
   await page.waitForFunction(() => document.querySelector('.phone-screen')?.naturalWidth === 100);
-  assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length), 1);
+  assert.equal(await page.evaluate(() => fixture.calls.filter(c => /\/preview(\?image=0)?$/.test(c.url ?? '')).length), 1);
   await page.locator('.screen-meta').filter({hasText: '最近一次截图（非实时）'}).waitFor();
   assert.equal(await page.evaluate(() => fixture.calls.filter(c => c.url?.includes('/preview/stream')).length), 0);
 });
@@ -761,7 +761,7 @@ test('a stale live preview is released and replaced by one screenshot', async t 
 test('each task observation is shown without the user refreshing', async t => {
   const page = await pageFor(t);
   await connect(page, 'ios', false);
-  const previews = () => page.evaluate(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length);
+  const previews = () => page.evaluate(() => fixture.calls.filter(c => /\/preview(\?image=0)?$/.test(c.url ?? '')).length);
   assert.equal(await previews(), 0);
   await page.evaluate(() => {
     fixture.state.task = { id: 'task', instruction: 'Inspect', state: 'observing', observationId: 'o1', confirmation: null, steps: [] };
@@ -769,12 +769,12 @@ test('each task observation is shown without the user refreshing', async t => {
   await page.locator('.task-status').waitFor();
   assert.equal(await previews(), 0, 'no capture while the task is still observing');
   await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'thinking' }; });
-  await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length === 1);
+  await page.waitForFunction(() => fixture.calls.filter(c => /\/preview(\?image=0)?$/.test(c.url ?? '')).length === 1);
   await page.locator('.phone-screen').waitFor();
   await page.locator('.screen-meta').filter({ hasText: '任务最近一次观察' }).waitFor();
   await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'executing' }; });
   await page.evaluate(() => { fixture.state.task = { ...fixture.state.task, state: 'thinking', observationId: 'o2' }; });
-  await page.waitForFunction(() => fixture.calls.filter(c => c.url?.endsWith('/preview')).length === 2);
+  await page.waitForFunction(() => fixture.calls.filter(c => /\/preview(\?image=0)?$/.test(c.url ?? '')).length === 2);
 });
 
 test('each task step shows its observation, model and action time', async t => {

@@ -254,8 +254,10 @@ impl BrowserClient {
             result
         })
     }
-    pub fn screen(&self) -> Promise {
-        self.session_promise("/preview", "GET", JsValue::UNDEFINED)
+    /// Capture a preview. With `lean`, ask the gateway to leave out `imageBase64`
+    /// (the picture is then loaded from `screen.jpg`); older gateways ignore it.
+    pub fn screen(&self, lean: bool) -> Promise {
+        self.session_promise(if lean { "/preview?image=0" } else { "/preview" }, "GET", JsValue::UNDEFINED)
     }
     /// Fetch the latest captured screen as JPEG bytes and return an object URL
     /// (the caller revokes it). Rejects with `status` set when the gateway has no

@@ -96,7 +96,7 @@ const fetchImpl = async (url, options = {}) => {
     const bytes = Uint8Array.from(atob(fixture.image.imageBase64), (c) => c.charCodeAt(0));
     return new Response(bytes, { headers: { "Content-Type": "image/jpeg", "Cache-Control": "no-store" } });
   }
-  if (url.endsWith("/preview")) {
+  if (/\/preview(\?image=0)?$/.test(url)) {
     if (fixture.holdNextPreview) {
       fixture.holdNextPreview = false;
       const stale = document.createElement("canvas");
