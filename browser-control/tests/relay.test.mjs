@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeFrame, decodeFrame } from '../src/relay-protocol.mjs';
+import { encodeFrame, decodeFrame } from './support/relay-protocol.mjs';
 
 test('binary relay frames preserve stream id and payload in SDK big endian format', () => {
   const frame = { type: 4, requestId: 7, streamId: 9, payload: Buffer.from([0, 255, 1]) };

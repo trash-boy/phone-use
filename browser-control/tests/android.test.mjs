@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AndroidCommands, androidUID, mapPoint, parseHierarchy, quote } from "../web/android/core.mjs";
 import { AndroidRelay, encodeFrame, decodeFrame } from "../web/android/relay.mjs";
-import { encodeFrame as nodeEncode, decodeFrame as nodeDecode } from "../src/relay-protocol.mjs";
+import { encodeFrame as nodeEncode, decodeFrame as nodeDecode } from "./support/relay-protocol.mjs";
 import { BrowserClient } from "../web/client.mjs";
 const turn = () => new Promise((resolve) => setImmediate(resolve));
 const signal = () => new AbortController().signal;
