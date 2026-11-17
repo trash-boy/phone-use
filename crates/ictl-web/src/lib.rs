@@ -2,6 +2,7 @@
 mod actions;
 #[cfg(target_arch = "wasm32")]
 pub mod android;
+pub mod android_text;
 #[cfg(target_arch = "wasm32")]
 mod client;
 pub mod identity;

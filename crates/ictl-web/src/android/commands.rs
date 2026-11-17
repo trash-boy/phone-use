@@ -1,6 +1,6 @@
+use crate::android_text;
 use crate::js::*;
 use js_sys::{Array, Promise};
-use regex::Regex;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -20,54 +20,23 @@ pub fn android_uid(value: JsValue) -> Result<String, JsValue> {
     crate::identity::android_uid(&value.as_string().ok_or_else(|| error("Invalid Android device serial"))?)
         .map_err(error)
 }
-fn decode_xml(value: &str) -> String {
-    let re = Regex::new(r"(?i)&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);").unwrap();
-    re.replace_all(value, |caps: &regex::Captures| {
-        let key = &caps[1];
-        match key {
-            "amp" => "&".into(),
-            "lt" => "<".into(),
-            "gt" => ">".into(),
-            "quot" => "\"".into(),
-            "apos" => "'".into(),
-            _ => {
-                let parsed = if key.starts_with("#x") || key.starts_with("#X") {
-                    u32::from_str_radix(&key[2..], 16).ok()
-                } else {
-                    key.strip_prefix('#').and_then(|s| s.parse::<u32>().ok())
-                };
-                parsed
-                    .and_then(char::from_u32)
-                    .filter(|c| *c != '\0')
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| if key.starts_with('#') { String::new() } else { caps[0].to_string() })
-            }
-        }
-    })
-    .into_owned()
-}
 #[wasm_bindgen(js_name=parseHierarchy)]
 pub fn parse_hierarchy(xml: String) -> Result<JsValue, JsValue> {
     if !xml.contains("<hierarchy") || !xml.contains("</hierarchy>") {
         return Err(error("Android UI hierarchy unavailable"));
     }
-    let node_re = Regex::new(r"<node\s+([^<>]*)/?\s*>").unwrap();
-    let attr_re = Regex::new(r#"([\w:-]+)="([^"]*)""#).unwrap();
-    let bounds_re = Regex::new(r"^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$").unwrap();
     let nodes = Array::new();
-    for node in node_re.captures_iter(&xml) {
+    for body in android_text::node_bodies(&xml) {
         let attrs = object();
-        for a in attr_re.captures_iter(&node[1]) {
-            set(&attrs, &a[1], &decode_xml(&a[2]).into());
+        for (name, value) in android_text::attributes(body) {
+            set(&attrs, name, &android_text::decode_xml(value).into());
         }
         if text(&attrs, "visible-to-user") == "false" {
             continue;
         }
-        let bounds = text(&attrs, "bounds");
-        let Some(caps) = bounds_re.captures(&bounds) else {
+        let Some(values) = android_text::bounds(&text(&attrs, "bounds")) else {
             continue;
         };
-        let values = (1..=4).map(|i| caps[i].parse::<f64>().unwrap_or(0.0)).collect::<Vec<_>>();
         if values[2] <= values[0] || values[3] <= values[1] {
             continue;
         }
@@ -93,18 +62,8 @@ pub fn parse_hierarchy(xml: String) -> Result<JsValue, JsValue> {
 }
 #[wasm_bindgen(js_name=inputViewport)]
 pub fn input_viewport(input: String) -> JsValue {
-    let display = Regex::new(r"displayId[=: ]+0\b").unwrap();
-    let bounds = Regex::new(r"logicalFrame=\[0,\s*0,\s*(\d+),\s*(\d+)\]").unwrap();
-    let orientation = Regex::new(r"orientation=(\d+)").unwrap();
-    let line = input.lines().find(|s| {
-        s.contains("Viewport") && display.is_match(s) && s.contains("logicalFrame") && !s.contains("valid=false")
-    });
-    if let Some(line) = line
-        && let (Some(boxes), Some(rotation)) = (bounds.captures(line), orientation.captures(line))
-    {
-        return json(
-            serde_json::json!({"width":boxes[1].parse::<u32>().unwrap_or(0),"height":boxes[2].parse::<u32>().unwrap_or(0),"orientation":rotation[1].parse::<u32>().unwrap_or(0)}),
-        );
+    if let Some((width, height, orientation)) = android_text::input_viewport(&input) {
+        return json(serde_json::json!({"width":width,"height":height,"orientation":orientation}));
     }
     JsValue::NULL
 }
@@ -566,7 +525,7 @@ impl AndroidCommands {
             }
             "launch_app" => {
                 let app = text(&request, "app");
-                if !Regex::new(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$").unwrap().is_match(&app) {
+                if !android_text::package_id(&app) {
                     return Err(error("Use an installed Android package ID from list_apps"));
                 }
                 let resolve_command = format!(
@@ -576,7 +535,7 @@ impl AndroidCommands {
                 let resolved = self.shell_command(resolve_command, &signal, Some(5000.0)).await?;
                 let resolved = resolved.as_string().unwrap_or_default();
                 let component = resolved.trim().lines().last().unwrap_or("");
-                if !Regex::new(r"^[\w.$]+/[\w.$]+$").unwrap().is_match(component) {
+                if !android_text::component(component) {
                     return Err(error("App has no launchable activity"));
                 }
                 let result = self
@@ -588,7 +547,7 @@ impl AndroidCommands {
             }
             "terminate_app" => {
                 let app = text(&request, "app");
-                if !Regex::new(r"^[\w.]+$").unwrap().is_match(&app) {
+                if !android_text::loose_package(&app) {
                     return Err(error("Invalid Android package ID"));
                 }
                 self.shell_command(format!("am force-stop {}", quote(app.into())), &signal, None).await?;
@@ -607,7 +566,7 @@ impl AndroidCommands {
                         Some(10000.0),
                     )
                     .await?;
-                if Regex::new("(?i)Error:|Exception").unwrap().is_match(&result.as_string().unwrap_or_default()) {
+                if android_text::reports_error(&result.as_string().unwrap_or_default()) {
                     return Err(error("Android could not open this URL"));
                 }
             }
@@ -618,6 +577,6 @@ impl AndroidCommands {
     }
 }
 fn launch_failed(output: &str) -> bool {
-    Regex::new("(?i)Error:|Exception").unwrap().is_match(output)
+    android_text::reports_error(output)
         || output.lines().filter_map(|l| l.trim().strip_prefix("Status:")).any(|s| s.trim() != "ok")
 }
