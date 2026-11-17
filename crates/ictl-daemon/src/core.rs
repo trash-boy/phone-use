@@ -297,7 +297,7 @@ pub(crate) struct Inner {
     /// HID 会话最近一次使用的时间；空闲超过 [`crate::supervise::HID_IDLE`] 就关掉（它持有屏幕媒体流）
     pub hid_used: Option<Instant>,
     /// 最近一次 HID 截图的像素宽高和时间。HID 触摸前核对横竖只要宽高，
-    /// [`crate::tools::HID_FRAME_REUSE`] 内不再为了它截一整张 PNG
+    /// [`crate::tools::hid_fallback::HID_FRAME_REUSE`] 内不再为了它截一整张 PNG
     pub hid_frame: Option<(Instant, (u32, u32))>,
     /// 最近一次读到的元素树。只在调用方允许（max_age_ms）时复用；改变界面的操作做完就清掉
     pub elements_cache: Option<(Instant, ictl_wda::elements::Tree)>,
