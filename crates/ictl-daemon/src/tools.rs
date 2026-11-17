@@ -92,7 +92,8 @@ impl Daemon {
         let Some(wda) = self.wda(g) else { return Ok(()) };
         let outcome = ictl_unlock::ensure_unlocked(wda, &cfg).await;
         checking.finish(outcome.is_ok());
-        g.unlocked_at = outcome.is_ok().then(Instant::now);
+        // 只有确认过没锁才记下：WDA 连不上（Unknown）时不知道锁没锁，记下的话之后 20 秒内的 HID 操作都不再检查
+        g.unlocked_at = outcome.as_ref().is_ok_and(|o| o.confirmed_unlocked()).then(Instant::now);
         // A WDA that keeps timing out on the lock query is stuck (seen after the phone slept through a long
         // confirmation wait). Health probes cannot run while requests hold the device lock, so restart it here.
         if matches!(outcome, Err(UnlockError::Wda(WdaError::Timeout(_)))) {
