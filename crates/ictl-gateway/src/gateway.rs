@@ -1485,4 +1485,16 @@ mod boundary_tests {
         assert_eq!(sent.load(Ordering::SeqCst), 1);
         session.cancel.cancel();
     }
+
+    #[tokio::test]
+    async fn command_ids_are_capped_per_session_without_dispatch() {
+        let (_gateway, session, sent, _dir) = fixture().await;
+        session.commands.lock().await.used.extend((0..10000).map(|n| format!("used-{n}")));
+        let error = session.run_command(tap("one-too-many"), session.cancel.clone()).await.unwrap_err();
+        assert_eq!((error.status, error.message.as_str()), (429, "Session command-ID limit reached"));
+        let replay = session.run_command(tap("used-7"), session.cancel.clone()).await.unwrap_err();
+        assert!(replay.message.contains("cannot be replayed"), "{}", replay.message);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        session.cancel.cancel();
+    }
 }

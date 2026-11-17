@@ -59,7 +59,7 @@ Rust 网关迁移后，容器 Dockerfile 已改为从当前源码编译两个 Ru
 
 ## Rust 网关迁移
 
-服务端入口迁移到 `crates/ictl-gateway`，启动命令和 Docker 运行阶段切换到 Rust。原 Node 实现移至 `tests/reference`，作为迁移前协议的测试参照。保留 React/TypeScript 工作台、发布版 WebUSB SDK 和原 Rust 控制引擎。
+服务端入口迁移到 `crates/ictl-gateway`，启动命令和 Docker 运行阶段切换到 Rust。原 Node 实现曾放在 `tests/reference` 作为测试参照，现已删除，相关断言已移到针对 Rust 网关的契约测试（`tests/rust-gateway-*.test.mjs`）。保留 React/TypeScript 工作台、发布版 WebUSB SDK 和原 Rust 控制引擎。
 
 自动化测试使用独立 Rust 服务进程、Node 原生 CLI fixture、HTTP 模型 fixture 和发布版 SDK，覆盖配对恢复互斥、命令去重及缓存淘汰、USB MTU、准备输入、任务确认与停止、静态文件、配置传递和 HTTP 读取期限。
 

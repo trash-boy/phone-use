@@ -11,4 +11,4 @@ if [ ! -x "$RUST_GATEWAY_BIN" ]; then
     echo "RUST_GATEWAY_BIN must point to an executable Rust gateway" >&2
     exit 1
 fi
-exec node --test tests/rust-gateway.test.mjs
+exec node --test tests/rust-gateway-*.test.mjs
