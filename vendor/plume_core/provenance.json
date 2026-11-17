@@ -1,0 +1,35 @@
+{
+  "upstream": "https://github.com/claration/impactor",
+  "revision": "b13d99559febd63e3710dfdd0ef8cdd78d10ae13",
+  "release": "Impactor v2.7.2",
+  "path": "plume_core (Impactor workspace crate)",
+  "version": "2.7.2",
+  "license": "MPL-2.0",
+  "upstreamArchiveSha256": "unknown",
+  "note": "importedFiles are SHA-256 hashes of the files as first vendored in phone-use commit a8aa285. That commit recorded src/ as unmodified upstream, while Cargo.toml already carried the local edits listed below; neither was re-verified against an upstream archive, so upstreamArchiveSha256 and upstream file hashes are unknown.",
+  "changes": [
+    "Cargo.toml: expand workspace inheritance into explicit versions, fix the omnisette path, use reqwest rustls-no-provider (no aws-lc-rs), omnisette with default-features = false and remote-anisette/remote-anisette-v3 only.",
+    "src/lib.rs: disable HTTP idle connection reuse so Apple login does not reuse a connection the server reset (marked as a local MPL-2.0 modification in the file).",
+    "src/utils/certificate.rs: share valid team signing identities across sessions of the same account and runtime, serialize certificate creation, migrate legacy identities, keep pending keys and fail safely at the certificate quota (phone-use 2094553, b65b68b); Cargo.toml adds tokio time/macros and libc for this.",
+    "src/developer/qh/certs.rs: tolerate missing status, status_code and expiration_date in certificate listings (serde defaults)."
+  ],
+  "phoneUseHistory": [
+    "a8aa285 (import)",
+    "bb9c6d5",
+    "65079ad",
+    "2094553",
+    "b65b68b"
+  ],
+  "importedFiles": {
+    "Cargo.toml": "9e2fb1004afdc61be74a3bcbf14c32850a1bc9c21281802ff7ae42f8dbbad3c0",
+    "src/lib.rs": "cf23ba7a0e437114f8a4fe932c4ed09b8278ef09733991934a7d7ff121af16ca",
+    "src/utils/certificate.rs": "11108a01b3f498a2ca1e2c388716e791d3300f671aa9ec1c6289e308d95d4d08",
+    "src/developer/qh/certs.rs": "02862d4949c823bd22d715f7ac6526a82fdf74b5c702fe54b51960d4457ed1f9"
+  },
+  "modifiedFiles": {
+    "Cargo.toml": "7037a03d45bacc78d24875fc92b823bee42f8460ca7f24cade3a6a21da13a5ba",
+    "src/lib.rs": "d103b13967d0e85a671ad2c78a873c9788a84d67759890ec3316ff05fcb81967",
+    "src/utils/certificate.rs": "9e21ab5089dd977ab4a1c199d660fc1d6648cb313eec854d79bd96644d6750bc",
+    "src/developer/qh/certs.rs": "9bc283cc30526ab7c98a3bb7c54ca533c1f4d927e1991f739df23f5f481cc859"
+  }
+}
